@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ## [Unreleased]
+## 1.2.7
+### Added all NFS share under one base share 
+- When user provide mountBackingShareName under storageclass all nfs share will be created inside that base share.
+- If that option is not provided a share is created as previously, consideing one share.
+
 ## 1.2.6
 ### Fixed Bug
 - Fixed error where floating IP's is not being used. 
