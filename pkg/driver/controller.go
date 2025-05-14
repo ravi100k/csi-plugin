@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"strconv"
@@ -43,6 +44,12 @@ const (
 
 var (
 	recentlyCreatedSnapshots = map[string]*csi.Snapshot{}
+	allowedSecOpts           = map[string]struct{}{
+		"SYS":   {},
+		"KRB5":  {},
+		"KRB5I": {},
+		"KRB5P": {},
+	}
 )
 
 func parseVolParams(params map[string]string) (common.HSVolumeParameters, error) {
@@ -88,29 +95,27 @@ func parseVolParams(params map[string]string) (common.HSVolumeParameters, error)
 	vParams.FSType = params["fsType"]
 
 	if exportOptionsParam, exists := params["exportOptions"]; exists {
-		if exists {
-			exportOptionsList := strings.Split(exportOptionsParam, ";")
-			vParams.ExportOptions = make([]common.ShareExportOptions, len(exportOptionsList))
-			for i, o := range exportOptionsList {
-				options := strings.Split(o, ",")
-				//assert options is len 3
-				if len(options) != 3 {
-					return vParams, status.Errorf(codes.InvalidArgument, common.InvalidExportOptions, o)
-				}
+		var exportOptions []common.ShareExportOptions
 
-				rootSquashStr := strings.TrimSpace(options[2])
-				rootSquash, err := strconv.ParseBool(rootSquashStr)
-				if err != nil {
-					return vParams, status.Errorf(codes.InvalidArgument, common.InvalidRootSquash, rootSquashStr)
-				}
+		err := json.Unmarshal([]byte(exportOptionsParam), &exportOptions)
+		if err != nil {
+			return vParams, status.Errorf(codes.InvalidArgument, "invalid exportOptions JSON: %v", err)
+		}
 
-				vParams.ExportOptions[i] = common.ShareExportOptions{
-					Subnet:            strings.TrimSpace(options[0]),
-					AccessPermissions: strings.TrimSpace(options[1]),
-					RootSquash:        rootSquash,
+		// Optional: Validate fields if needed (e.g., ensure AccessPermissions is "RO" or "RW")
+		for _, opt := range exportOptions {
+			if opt.AccessPermissions != "RO" && opt.AccessPermissions != "RW" {
+				return vParams, status.Errorf(codes.InvalidArgument, "unsupported accessPermissions value: %s", opt.AccessPermissions)
+			}
+			// Validate SecurityOptions
+			for _, sec := range opt.SecurityOptions {
+				if _, ok := allowedSecOpts[sec]; !ok {
+					return vParams, status.Errorf(codes.InvalidArgument, "invalid securityOption: %s", sec)
 				}
 			}
 		}
+
+		vParams.ExportOptions = exportOptions
 	}
 
 	if volumeNameFormat, exists := params["volumeNameFormat"]; exists {
