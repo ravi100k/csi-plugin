@@ -102,16 +102,24 @@ func parseVolParams(params map[string]string) (common.HSVolumeParameters, error)
 			return vParams, status.Errorf(codes.InvalidArgument, "invalid exportOptions JSON: %v", err)
 		}
 
-		// Optional: Validate fields if needed (e.g., ensure AccessPermissions is "RO" or "RW")
-		for _, opt := range exportOptions {
-			if opt.AccessPermissions != "RO" && opt.AccessPermissions != "RW" {
-				return vParams, status.Errorf(codes.InvalidArgument, "unsupported accessPermissions value: %s", opt.AccessPermissions)
+		// Normalize here before assigning or validating
+		for i := range exportOptions {
+			// Normalize
+			ap := strings.ToUpper(strings.TrimSpace(exportOptions[i].AccessPermissions))
+			exportOptions[i].AccessPermissions = ap
+
+			if ap != "RO" && ap != "RW" {
+				return vParams, status.Errorf(codes.InvalidArgument,
+					"unsupported accessPermissions value: %q (normalized: %q)", params["accessPermissions"], ap)
 			}
-			// Validate SecurityOptions
-			for _, sec := range opt.SecurityOptions {
-				if _, ok := allowedSecOpts[sec]; !ok {
+
+			// Normalize SecurityOptions
+			for j, sec := range exportOptions[i].SecurityOptions {
+				secNorm := strings.ToUpper(strings.TrimSpace(sec))
+				if _, ok := allowedSecOpts[secNorm]; !ok {
 					return vParams, status.Errorf(codes.InvalidArgument, "invalid securityOption: %s", sec)
 				}
+				exportOptions[i].SecurityOptions[j] = secNorm
 			}
 		}
 
