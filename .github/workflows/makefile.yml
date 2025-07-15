@@ -1,0 +1,34 @@
+name: CSI Plugin Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.3' # Update as per your target Go version
+
+      - name: Show Go version
+        run: go version
+
+      - name: Tidy and download modules
+        run: |
+          go mod tidy
+          go mod download
+
+      - name: Build CSI Plugin binary
+        run: make compile
+
+      - name: Build Docker release image
+        run: make build-release
