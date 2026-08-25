@@ -24,7 +24,9 @@ package driver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -43,19 +45,22 @@ import (
 // guaranteed to have `fsfreeze` from util-linux — and freeze the mount via
 // its shared /var/lib/kubelet propagation.
 type FrozenTarget struct {
-	Namespace string // kube-system, where csi-node lives
-	PodName   string // csi-node-XXXXX
-	Container string // hs-csi-plugin-node
-	MountPath string // /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount
+	Namespace string `json:"namespace"` // kube-system, where csi-node lives
+	PodName   string `json:"podName"`   // csi-node-XXXXX
+	Container string `json:"container"` // hs-csi-plugin-node
+	MountPath string `json:"mountPath"` // kubelet-managed CSI mount
+	NodeName  string `json:"nodeName"`  // used to resolve a replacement csi-node pod
 	// For diagnostics only:
-	UserPodNs   string
-	UserPodName string
+	UserPodNs   string `json:"userPodNamespace"`
+	UserPodName string `json:"userPodName"`
 }
 
 // Freezer holds the kube client + REST config needed to exec into pods.
 type Freezer struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 	restCfg   *rest.Config
+	state     frozenTargetStore
+	exec      func(context.Context, FrozenTarget, string) error
 }
 
 // NewFreezer builds a Freezer from the pod's in-cluster credentials. If the
@@ -72,7 +77,14 @@ func NewFreezer() *Freezer {
 		log.Warnf("Freezer: kubernetes.NewForConfig failed (%v); consistency-freeze disabled", err)
 		return nil
 	}
-	return &Freezer{clientset: cs, restCfg: cfg}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "kube-system"
+	}
+	f := &Freezer{clientset: cs, restCfg: cfg}
+	f.state = &kubeFrozenTargetStore{clientset: cs, namespace: namespace}
+	f.exec = f.execFsfreeze
+	return f
 }
 
 // FreezeForVolumeHandle locates every running Pod that has the CSI volume
@@ -98,12 +110,26 @@ func (f *Freezer) FreezeForVolumeHandle(ctx context.Context, volumeHandle string
 	}
 	var frozen []FrozenTarget
 	for _, t := range targets {
-		if err := f.execFsfreeze(ctx, t, "--freeze"); err != nil {
-			log.Warnf("Freezer: fsfreeze --freeze via %s/%s for %s/%s (path=%s) FAILED: %v",
-				t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath, err)
+		if f.state == nil {
+			log.Errorf("Freezer: no persistent freeze-state store; refusing to freeze %s", t.MountPath)
 			continue
 		}
-		log.Infof("Freezer: fsfreeze --freeze via %s/%s for %s/%s (path=%s) OK",
+		// Persist intent BEFORE freezing. This closes the fatal crash window
+		// between a successful fsfreeze and writing its recovery record. A crash
+		// at any point after Save leaves a target for the next leader to thaw.
+		if err := f.state.Save(context.WithoutCancel(ctx), t); err != nil {
+			log.Errorf("Freezer: persist freeze intent for %s failed: %v; refusing to freeze", t.MountPath, err)
+			continue
+		}
+		if err := f.runFsfreeze(ctx, t, "--freeze"); err != nil {
+			log.Warnf("Freezer: fsfreeze --freeze via %s/%s for %s/%s (path=%s) FAILED: %v",
+				t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath, err)
+			if deleteErr := f.state.Delete(context.WithoutCancel(ctx), t); deleteErr != nil {
+				log.Errorf("Freezer: remove failed freeze intent for %s: %v", t.MountPath, deleteErr)
+			}
+			continue
+		}
+		log.Infof("Freezer: fsfreeze --freeze via %s/%s for %s/%s (path=%s) OK and persisted",
 			t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath)
 		frozen = append(frozen, t)
 	}
@@ -118,14 +144,58 @@ func (f *Freezer) Unfreeze(ctx context.Context, frozen []FrozenTarget) {
 	}
 	for i := len(frozen) - 1; i >= 0; i-- {
 		t := frozen[i]
-		if err := f.execFsfreeze(ctx, t, "--unfreeze"); err != nil {
+		if err := f.runFsfreeze(ctx, t, "--unfreeze"); err != nil {
 			log.Errorf("Freezer: fsfreeze --unfreeze via %s/%s for %s/%s (path=%s) FAILED — filesystem may remain frozen; investigate: %v",
 				t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath, err)
 			continue
 		}
 		log.Infof("Freezer: fsfreeze --unfreeze via %s/%s for %s/%s (path=%s) OK",
 			t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath)
+		if f.state != nil {
+			if err := f.state.Delete(context.WithoutCancel(ctx), t); err != nil {
+				log.Errorf("Freezer: remove recovered state for %s failed: %v", t.MountPath, err)
+			}
+		}
 	}
+}
+
+func (f *Freezer) runFsfreeze(ctx context.Context, target FrozenTarget, op string) error {
+	if f.exec != nil {
+		return f.exec(ctx, target, op)
+	}
+	return f.execFsfreeze(ctx, target, op)
+}
+
+// RecoverFrozenTargets thaws every target left in the cluster-persistent state
+// store by a crashed controller. Successful entries are removed; failures stay
+// recorded for the next leadership/startup reconciliation.
+func (f *Freezer) RecoverFrozenTargets(ctx context.Context) error {
+	if f == nil || f.state == nil {
+		return nil
+	}
+	targets, err := f.state.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list persisted frozen targets: %w", err)
+	}
+	var recoveryErrors []error
+	for _, target := range targets {
+		if target.NodeName != "" {
+			pod, container, resolveErr := f.findCsiNodePodOnNode(ctx, target.NodeName)
+			if resolveErr != nil {
+				recoveryErrors = append(recoveryErrors, fmt.Errorf("resolve csi-node for %s: %w", target.MountPath, resolveErr))
+				continue
+			}
+			target.Namespace, target.PodName, target.Container = pod.Namespace, pod.Name, container
+		}
+		if err := f.runFsfreeze(ctx, target, "--unfreeze"); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("unfreeze %s: %w", target.MountPath, err))
+			continue
+		}
+		if err := f.state.Delete(ctx, target); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("delete state for %s: %w", target.MountPath, err))
+		}
+	}
+	return errors.Join(recoveryErrors...)
 }
 
 // findMountsForVolumeHandle returns every (csi-node-pod, mountPath) tuple
@@ -210,6 +280,7 @@ func (f *Freezer) findMountsForVolumeHandle(ctx context.Context, volumeHandle st
 			PodName:     csiNodePod.Name,
 			Container:   csiNodeContainer,
 			MountPath:   mountPath,
+			NodeName:    nodeName,
 			UserPodNs:   userPod.Namespace,
 			UserPodName: userPod.Name,
 		})

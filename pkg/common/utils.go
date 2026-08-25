@@ -15,7 +15,7 @@ func GetCacheData(key string) (interface{}, error) {
 }
 
 func SetCacheData(key string, value interface{}, cacheExpireTime int) {
-	if cacheExpireTime != 0 {
+	if cacheExpireTime == 0 {
 		cacheExpireTime = 60 // 1 min is default timeout
 	}
 	cache.Set(key, value, time.Duration(cacheExpireTime)*time.Second)

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,23 +88,46 @@ var (
 )
 
 type HammerspaceClient struct {
-	username   string
-	password   string
-	endpoint   string
-	httpclient *http.Client
+	username        string
+	password        string
+	endpoint        string
+	httpclient      *http.Client
+	loginMu         sync.Mutex
+	loginGeneration uint64
 }
 
 func NewHammerspaceClient(endpoint, username, password string, tlsVerify bool) (*HammerspaceClient, error) {
+	return NewHammerspaceClientWithCA(endpoint, username, password, tlsVerify, "")
+}
+
+// NewHammerspaceClientWithCA creates an Anvil client with optional custom CA
+// trust. caBundlePath is only used when certificate verification is enabled.
+func NewHammerspaceClientWithCA(endpoint, username, password string, tlsVerify bool, caBundlePath string) (*HammerspaceClient, error) {
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		log.Error(err)
 		return nil, err
 	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: !tlsVerify}
+	if tlsVerify && caBundlePath != "" {
+		caPEM, readErr := os.ReadFile(caBundlePath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read Anvil CA bundle %q: %w", caBundlePath, readErr)
+		}
+		rootCAs, poolErr := x509.SystemCertPool()
+		if poolErr != nil || rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if !rootCAs.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("Anvil CA bundle %q contains no valid certificates", caBundlePath)
+		}
+		tlsConfig.RootCAs = rootCAs
+	}
 	tr := &http.Transport{
 		MaxIdleConns:       10,
 		IdleConnTimeout:    30 * time.Second,
 		DisableCompression: true,
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: !tlsVerify},
+		TLSClientConfig:    tlsConfig,
 	}
 	httpclient := &http.Client{
 		Transport: tr,
@@ -243,6 +267,24 @@ func (client *HammerspaceClient) GetDataPortals(ctx context.Context, nodeID stri
 
 // Logs into Hammerspace Anvil Server
 func (client *HammerspaceClient) EnsureLogin() error {
+	client.loginMu.Lock()
+	defer client.loginMu.Unlock()
+	return client.loginLocked()
+}
+
+// loginAfterUnauthorized refreshes the session only if no other request has
+// already refreshed it since this request began. This prevents a burst of 401s
+// from creating one new Anvil session per concurrent CSI request.
+func (client *HammerspaceClient) loginAfterUnauthorized(observedGeneration uint64) error {
+	client.loginMu.Lock()
+	defer client.loginMu.Unlock()
+	if client.loginGeneration != observedGeneration {
+		return nil
+	}
+	return client.loginLocked()
+}
+
+func (client *HammerspaceClient) loginLocked() error {
 	v := url.Values{}
 	v.Add("username", client.username)
 	v.Add("password", client.password)
@@ -252,23 +294,19 @@ func (client *HammerspaceClient) EnsureLogin() error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	bodyString := string(body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 	responseLog := log.WithFields(log.Fields{
 		"statusCode": resp.StatusCode,
-		"body":       bodyString,
-		"headers":    resp.Header,
 		"url":        resp.Request.URL,
 	})
 
-	if err != nil {
-		log.Error(err)
-	}
 	if resp.StatusCode != 200 {
 		err = errors.New("failed to login to Hammerspace Anvil")
 		responseLog.Error(err)
+		return err
 	}
-	return err
+	client.loginGeneration++
+	return nil
 }
 
 func (client *HammerspaceClient) doRequest(ctx context.Context, req http.Request) (int, string, map[string][]string, error) {
@@ -286,11 +324,33 @@ func (client *HammerspaceClient) doRequest(ctx context.Context, req http.Request
 	)(nil)
 	log.Debugf("sending request %s %s", req.Method, req.URL)
 
-	resp, err := client.httpclient.Do(req.WithContext(ctx))
+	client.loginMu.Lock()
+	loginGeneration := client.loginGeneration
+	client.loginMu.Unlock()
+
+	request := req.WithContext(ctx)
+	resp, err := client.httpclient.Do(request)
 	// Attempt to login
 	if err == nil && (resp.StatusCode == 401 || resp.StatusCode == 403) {
-		client.EnsureLogin()
-		resp, err = client.httpclient.Do(req.WithContext(ctx))
+		// The first response must be closed before reusing the transport. The
+		// original request body has already been consumed, so create a fresh body
+		// through GetBody instead of re-sending an empty POST/PUT.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if loginErr := client.loginAfterUnauthorized(loginGeneration); loginErr != nil {
+			return resp.StatusCode, "", resp.Header, loginErr
+		}
+		retryRequest := req.Clone(ctx)
+		if req.Body != nil {
+			if req.GetBody == nil {
+				return resp.StatusCode, "", resp.Header, errors.New("cannot retry authenticated request: request body is not replayable")
+			}
+			retryRequest.Body, err = req.GetBody()
+			if err != nil {
+				return resp.StatusCode, "", resp.Header, fmt.Errorf("cannot rebuild authenticated request body: %w", err)
+			}
+		}
+		resp, err = client.httpclient.Do(retryRequest)
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -401,8 +461,7 @@ func (client *HammerspaceClient) WaitForTaskCompletionResult(ctx context.Context
 
 		req, err := client.generateRequest(ctx, "GET", "/tasks/"+taskId, "")
 		if err != nil {
-			log.Error("Failed to generate request object")
-			os.Exit(1)
+			return &task, false, fmt.Errorf("failed to generate task request: %w", err)
 		}
 		statusCode, respBody, _, err := client.doRequest(ctx, *req)
 		if err != nil {
@@ -682,6 +741,9 @@ func (client *HammerspaceClient) GetShareRawFields(ctx context.Context, name str
 
 func (client *HammerspaceClient) GetFile(ctx context.Context, path string) (*common.File, error) {
 	req, err := client.generateRequest(ctx, "GET", "/files?path="+url.PathEscape(path), "")
+	if err != nil {
+		return nil, err
+	}
 	statusCode, respBody, _, err := client.doRequest(ctx, *req)
 
 	if err != nil {
@@ -689,10 +751,6 @@ func (client *HammerspaceClient) GetFile(ctx context.Context, path string) (*com
 		return nil, err
 	}
 
-	// FIXME: we get a 500 from the api if it does not exist, should be a 404
-	if statusCode == 500 {
-		return nil, nil
-	}
 	if statusCode == 404 {
 		return nil, nil
 	}

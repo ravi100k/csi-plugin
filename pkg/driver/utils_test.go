@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hammer-space/csi-plugin/pkg/common"
 )
 
 func TestGetSnapshotNameFromSnapshotId(t *testing.T) {
@@ -74,6 +76,36 @@ func TestGetVolumeNameFromPath(t *testing.T) {
 		t.Logf("Expected: %v", expected)
 		t.Logf("Actual: %v", actual)
 		t.FailNow()
+	}
+}
+
+func TestBackingShareNameFromVolumeID(t *testing.T) {
+	cases := map[string]string{
+		"/test-backing-share/test-volume": "test-backing-share",
+		"test-backing-share/test-volume":  "test-backing-share",
+		"/test-backing-share":             "test-backing-share",
+		"/":                               "",
+		"":                                "",
+	}
+	for volumeID, want := range cases {
+		if got := backingShareNameFromVolumeID(volumeID); got != want {
+			t.Errorf("backingShareNameFromVolumeID(%q) = %q, want %q", volumeID, got, want)
+		}
+	}
+}
+
+func TestLoopDeviceForBackingFileHandlesSpaces(t *testing.T) {
+	originalExec := common.ExecCommand
+	defer func() { common.ExecCommand = originalExec }()
+	common.ExecCommand = func(command string, args ...string) ([]byte, error) {
+		return []byte("/dev/loop12: [0038]:42 (/tmp/backing share/volume (deleted))\n"), nil
+	}
+	device, err := loopDeviceForBackingFile("/tmp/backing share/volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device != "/dev/loop12" {
+		t.Fatalf("device = %q, want /dev/loop12", device)
 	}
 }
 

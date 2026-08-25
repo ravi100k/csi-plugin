@@ -18,10 +18,13 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hammer-space/csi-plugin/pkg/common"
@@ -57,6 +60,9 @@ type CSIDriver struct {
 	// create (which serialized all file creation on a share to ~1 at a time).
 	mountRefsMu sync.Mutex
 	mountRefs   map[string]int
+	// nodeStageMu protects the shared root-export marker set and mount across
+	// concurrent NodeStage/NodeUnstage calls on this node.
+	nodeStageMu sync.Mutex
 	// mountLocks holds one lock per backing-share staging directory. It serializes
 	// the actual mount/unmount of a given backing share so the slow (up to ~5 min)
 	// NFS mount never runs under the global mountRefsMu. mountRefsMu then guards only
@@ -72,16 +78,23 @@ type CSIDriver struct {
 	// in-cluster (local dev) — in that case snapshots are still taken but
 	// consistency is not enforced.
 	freezer *Freezer
+	// Controller RPCs are gated when Kubernetes Lease election is enabled. The
+	// node and identity services remain available on every replica.
+	leaderElectionEnabled atomic.Bool
+	controllerLeader      atomic.Bool
 }
 
 func NewCSIDriver(endpoint, username, password, tlsVerifyStr string) *CSIDriver {
-	tlsVerify := false
+	// Secure by default. Existing installations that explicitly set false keep
+	// working during migration, but the opt-out is prominently logged.
+	tlsVerify := true
 	if os.Getenv("HS_TLS_VERIFY") != "" {
 		tlsVerify, _ = strconv.ParseBool(tlsVerifyStr)
-	} else {
-		tlsVerify = false
 	}
-	client, err := client.NewHammerspaceClient(endpoint, username, password, tlsVerify)
+	if !tlsVerify {
+		log.Warn("HS_TLS_VERIFY=false disables Anvil certificate verification; use only as a temporary compatibility setting")
+	}
+	client, err := client.NewHammerspaceClientWithCA(endpoint, username, password, tlsVerify, os.Getenv("HS_CA_BUNDLE"))
 	if err != nil {
 		log.Error(err)
 		os.Exit(1)
@@ -89,7 +102,7 @@ func NewCSIDriver(endpoint, username, password, tlsVerifyStr string) *CSIDriver 
 	// We now require mounting through a DSX server
 	common.UseAnvil = false
 
-	return &CSIDriver{
+	driver := &CSIDriver{
 		hsclient:      client,
 		volumeLocks:   make(map[string]*keyLock),
 		snapshotLocks: make(map[string]*keyLock),
@@ -98,7 +111,27 @@ func NewCSIDriver(endpoint, username, password, tlsVerifyStr string) *CSIDriver 
 		NodeID:        os.Getenv("CSI_NODE_NAME"),
 		freezer:       NewFreezer(),
 	}
+	driver.controllerLeader.Store(true)
+	return driver
 
+}
+
+// EnableControllerLeaderElection rejects controller RPCs until SetControllerLeader
+// marks this replica as the active Kubernetes Lease holder.
+func (c *CSIDriver) EnableControllerLeaderElection() {
+	c.leaderElectionEnabled.Store(true)
+	c.controllerLeader.Store(false)
+}
+
+func (c *CSIDriver) SetControllerLeader(isLeader bool) {
+	c.controllerLeader.Store(isLeader)
+}
+
+func (c *CSIDriver) RecoverFrozenTargets(ctx context.Context) error {
+	if c.freezer == nil {
+		return nil
+	}
+	return c.freezer.RecoverFrozenTargets(ctx)
 }
 
 type keyLock struct {
@@ -233,6 +266,11 @@ func (c *CSIDriver) callInterceptor(
 	req interface{},
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (interface{}, error) {
+	if c.leaderElectionEnabled.Load() &&
+		strings.HasPrefix(info.FullMethod, "/csi.v1.Controller/") &&
+		!c.controllerLeader.Load() {
+		return nil, status.Error(codes.Unavailable, "controller replica is not the active leader")
+	}
 	rsp, err := handler(ctx, req)
 	logGRPC(info.FullMethod, req, rsp, err)
 	return rsp, err
@@ -241,8 +279,10 @@ func (c *CSIDriver) callInterceptor(
 func logGRPC(method string, request, reply interface{}, err error) {
 	fields := log.Fields{
 		"grpc_method": method,
-		"request":     request,
-		"response":    reply,
+		// CSI request messages may contain a Secrets map. Never serialize the
+		// request into logs; its concrete type is enough to correlate debug calls.
+		"request_type": fmt.Sprintf("%T", request),
+		"response":     reply,
 	}
 	if err != nil {
 		fields["error"] = err.Error()

@@ -18,10 +18,12 @@ package client
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -29,6 +31,37 @@ import (
 	common "github.com/hammer-space/csi-plugin/pkg/common"
 	testutils "github.com/hammer-space/csi-plugin/test/utils"
 )
+
+func TestNewHammerspaceClientWithCustomCA(t *testing.T) {
+	loginPath := BasePath + "/login"
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != loginPath {
+			t.Errorf("path = %q, want %q", r.URL.Path, loginPath)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer tlsServer.Close()
+
+	cert := tlsServer.Certificate()
+	caFile, err := os.CreateTemp(t.TempDir(), "anvil-ca-*.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pem.Encode(caFile, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err := caFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewHammerspaceClientWithCA(tlsServer.URL, "user", "password", true, caFile.Name())
+	if err != nil {
+		t.Fatalf("custom CA client failed: %v", err)
+	}
+	if client == nil {
+		t.Fatal("custom CA client is nil")
+	}
+}
 
 var (
 	Mux      *http.ServeMux
@@ -51,6 +84,52 @@ func setupHTTP() {
 
 func tearDownHTTP() {
 	Server.Close()
+}
+
+func TestDoRequestReplaysBodyAfterAuthenticationRetry(t *testing.T) {
+	setupHTTP()
+	defer tearDownHTTP()
+
+	const requestBody = `{"name":"volume-a"}`
+	requestCount := 0
+	loginCount := 0
+	Mux.HandleFunc(BasePath+"/login", func(w http.ResponseWriter, r *http.Request) {
+		loginCount++
+		w.WriteHeader(http.StatusOK)
+	})
+	Mux.HandleFunc(BasePath+"/shares", func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		if string(body) != requestBody {
+			t.Errorf("request %d body = %q, want %q", requestCount, body, requestBody)
+		}
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	req, err := hsclient.generateRequest(context.Background(), http.MethodPost, "/shares", requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusCode, _, _, err := hsclient.doRequest(context.Background(), *req)
+	if err != nil {
+		t.Fatalf("doRequest returned error: %v", err)
+	}
+	if statusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", statusCode, http.StatusAccepted)
+	}
+	if requestCount != 2 {
+		t.Fatalf("request count = %d, want 2", requestCount)
+	}
+	if loginCount != 1 {
+		t.Fatalf("login count = %d, want 1", loginCount)
+	}
 }
 
 func TestListShares(t *testing.T) {
@@ -141,6 +220,23 @@ func TestListShares(t *testing.T) {
 	if err != nil {
 		t.Logf("Expected error: %v", err)
 		t.Fail()
+	}
+}
+
+func TestGetFileDoesNotTreatServerErrorAsAbsent(t *testing.T) {
+	setupHTTP()
+	defer tearDownHTTP()
+
+	Mux.HandleFunc(BasePath+"/files", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "backend unavailable", http.StatusInternalServerError)
+	})
+
+	file, err := hsclient.GetFile(context.Background(), "/backing/volume")
+	if err == nil {
+		t.Fatal("GetFile returned nil error for HTTP 500")
+	}
+	if file != nil {
+		t.Fatalf("GetFile returned file %#v for HTTP 500", file)
 	}
 }
 

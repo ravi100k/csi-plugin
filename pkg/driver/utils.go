@@ -104,15 +104,9 @@ func AttachLoopDevice(filePath string, readOnly bool) (string, error) {
 func AttachLoopDeviceWithRetry(filePath string, readOnly bool) (string, error) {
 	log.Debugf("Recived request to AttachLoopDeviceWithRetry for filepath %s", filePath)
 	// Step 1: Check if already attached
-	output, err := common.ExecCommand("losetup", "-j", filePath)
-	if err == nil && strings.TrimSpace(string(output)) != "" {
-		// Example output: "/dev/loop3: [12345]:123 (/path/to/file)"
-		fields := strings.Split(string(output), ":")
-		if len(fields) > 0 {
-			device := strings.TrimSpace(fields[0])
-			log.Infof("Backing file %s already attached to loop device %s", filePath, device)
-			return device, nil
-		}
+	if device, err := loopDeviceForBackingFile(filePath); err == nil && device != "" {
+		log.Infof("Backing file %s already attached to loop device %s", filePath, device)
+		return device, nil
 	}
 
 	// 3. Create loop device if missing
@@ -155,6 +149,50 @@ func AttachLoopDeviceWithRetry(filePath string, readOnly bool) (string, error) {
 	return "", fmt.Errorf("failed to attach loop device for %s after %d retries: %w", filePath, maxRetries, lastErr)
 }
 
+// loopDeviceForBackingFile asks losetup for the exact backing file and parses
+// only the device prefix before the first colon. This remains correct when the
+// backing path contains spaces, parentheses, or " (deleted)" suffix text.
+func loopDeviceForBackingFile(filePath string) (string, error) {
+	output, err := common.ExecCommand("losetup", "-j", filePath)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		separator := strings.IndexByte(line, ':')
+		if separator <= 0 {
+			return "", fmt.Errorf("unexpected losetup output %q", line)
+		}
+		device := strings.TrimSpace(line[:separator])
+		if !strings.HasPrefix(device, "/dev/loop") {
+			return "", fmt.Errorf("unexpected loop device %q", device)
+		}
+		return device, nil
+	}
+	return "", nil
+}
+
+func detachLoopDevice(ctx context.Context, dev string) error {
+	if dev == "" {
+		return nil
+	}
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		out, err := common.ExecCommand("losetup", "-d", dev)
+		if err == nil {
+			log.Infof("Loop device %s detached successfully", dev)
+			return nil
+		}
+		lastErr = fmt.Errorf("losetup -d %s: %w (output: %s)", dev, err, strings.TrimSpace(string(out)))
+		log.Warnf("Attempt %d: %v", i+1, lastErr)
+		time.Sleep(retryInterval)
+	}
+	return fmt.Errorf("failed to detach loop device after %d retries: %w", maxRetries, lastErr)
+}
+
 // CleanupLoopDevice detaches a loop device if it exists
 func CleanupLoopDevice(ctx context.Context, dev string) {
 	_, span := tracer.Start(ctx, "CleanupLoopDevice", trace.WithAttributes(
@@ -166,17 +204,9 @@ func CleanupLoopDevice(ctx context.Context, dev string) {
 		return
 	}
 
-	for i := 0; i < maxRetries; i++ {
-		out, err := common.ExecCommand("losetup", "-d", dev)
-		if err == nil {
-			log.Infof("Loop device %s detached successfully", dev)
-			return
-		}
-		log.Warnf("Attempt %d: Failed to detach loop device %s: %v. Output: %s", i+1, dev, err, string(out))
-		time.Sleep(retryInterval)
+	if err := detachLoopDevice(ctx, dev); err != nil {
+		log.Error(err)
 	}
-
-	log.Errorf("Failed to detach loop device %s after %d retries", dev, maxRetries)
 }
 
 func IsValueInList(value string, list []string) bool {
@@ -190,6 +220,17 @@ func IsValueInList(value string, list []string) bool {
 
 func GetVolumeNameFromPath(path string) string {
 	return filepath.Base(path)
+}
+
+// backingShareNameFromVolumeID returns the first path component of a
+// file/directory-backed CSI volume ID. It canonicalizes /share/file and
+// share/file to the same bare share name for locks and Hammerspace API calls.
+func backingShareNameFromVolumeID(volumeID string) string {
+	cleaned := strings.Trim(filepath.ToSlash(volumeID), "/")
+	if cleaned == "" {
+		return ""
+	}
+	return strings.SplitN(cleaned, "/", 2)[0]
 }
 
 // isFileBackedVolumeID reports, with no REST call, whether a volume ID refers to
@@ -755,20 +796,25 @@ func (d *CSIDriver) WaitForPathReady(ctx context.Context, path string, pollInter
 	}
 }
 
-func IsAnyVolumeStillMounted(baseMarkerDir string) bool {
+func IsAnyVolumeStillMounted(baseMarkerDir string) (bool, error) {
 	files, err := os.ReadDir(baseMarkerDir)
 	if err != nil {
-		return false // Fail safe
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		// Fail closed: an unreadable marker directory must never authorize
+		// unmounting the shared root export from under live volumes.
+		return true, err
 	}
 
 	for _, f := range files {
 		log.Debugf("volume marker still present at %s", f.Name())
 		if strings.HasSuffix(f.Name(), ".marker") {
-			return true
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 func GetHashedMarkerPath(baseDir, volmeID string) string {

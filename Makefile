@@ -1,6 +1,11 @@
 VERSION ?= $(shell cat ./VERSION)
 GITHASH ?= $(shell git describe --match nEvErMatch --always --abbrev=10 --dirty)
 NAME=bin/hs-csi-plugin
+RELEASE_IMAGE ?= hammerspaceinc/csi-plugin:${VERSION}
+TRIVY_SEVERITY ?= HIGH,CRITICAL
+RELEASE_BUILD_FLAGS ?= --pull --no-cache
+
+.PHONY: compile clean unittest sanity build-dev build build-release build-release-image scan-release
 
 compile:
 	@echo "==> Building the Hammerspace CSI Driver Version ${VERSION}"
@@ -30,6 +35,17 @@ build:
 	@echo "==> Building Docker Image Latest"
 	@docker build -t "hammerspaceinc/csi-plugin:latest" . -f Dockerfile --no-cache
 
-build-release:
+build-release: build-release-image
+	@$(MAKE) --no-print-directory scan-release
+
+build-release-image:
 	@echo "==> Building Docker Image ${VERSION} ${GITHASH}"
-	@docker build --build-arg version=${VERSION} -t "hammerspaceinc/csi-plugin:${VERSION}" . -f Dockerfile
+	@docker build ${RELEASE_BUILD_FLAGS} --build-arg version=${VERSION} -t "${RELEASE_IMAGE}" . -f Dockerfile
+
+scan-release:
+	@command -v trivy >/dev/null 2>&1 || { \
+		echo "ERROR: Trivy is required to scan release images: https://trivy.dev/latest/getting-started/installation/"; \
+		exit 1; \
+	}
+	@echo "==> Scanning Docker Image ${RELEASE_IMAGE} with Trivy"
+	@trivy image --exit-code 1 --severity "${TRIVY_SEVERITY}" "${RELEASE_IMAGE}"

@@ -17,10 +17,12 @@ limitations under the License.
 package common
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -59,7 +61,7 @@ type inFlightMount struct {
 	err  error
 }
 
-// mountInFlight deduplicates concurrent/retried mount syscalls by target path.
+// mountInFlight deduplicates identical concurrent/retried mount syscalls.
 //
 // A `hard` NFS mount against a dead data portal blocks uninterruptibly in the
 // kernel, so MountShare can't kill the goroutine running it — it can only time
@@ -73,24 +75,31 @@ var (
 	mountInFlight   = map[string]*inFlightMount{}
 )
 
-// beginMount starts mountFn for targetPath, unless a mount for that same target is
+// mountAttemptKey includes the source and options as well as the target. A retry
+// to the same target through a different data portal must be allowed to start;
+// otherwise a hung portal defeats the caller's failover loop.
+func mountAttemptKey(sourcePath, targetPath string, mountFlags []string) string {
+	return sourcePath + "\x00" + targetPath + "\x00" + strings.Join(mountFlags, "\x00")
+}
+
+// beginMount starts mountFn for mountKey, unless that exact attempt is
 // already running, in which case it returns the in-flight attempt and does NOT call
 // mountFn again. The returned inFlightMount's done channel is closed when the syscall
 // returns; its err holds the result. Callers wait on it with their own timeout, so a
 // timed-out caller leaves the single shared goroutine running rather than forking a
 // new one on the next retry.
-func beginMount(targetPath string, mountFn func() error) *inFlightMount {
+func beginMount(mountKey string, mountFn func() error) *inFlightMount {
 	mountInFlightMu.Lock()
 	defer mountInFlightMu.Unlock()
-	if att, ok := mountInFlight[targetPath]; ok {
+	if att, ok := mountInFlight[mountKey]; ok {
 		return att
 	}
 	att := &inFlightMount{done: make(chan struct{})}
-	mountInFlight[targetPath] = att
+	mountInFlight[mountKey] = att
 	go func() {
 		mountErr := mountFn()
 		mountInFlightMu.Lock()
-		delete(mountInFlight, targetPath)
+		delete(mountInFlight, mountKey)
 		mountInFlightMu.Unlock()
 		att.err = mountErr
 		close(att.done)
@@ -452,7 +461,7 @@ func MountShare(ctx context.Context, sourcePath, targetPath string, mountFlags [
 	// but it holds no lock, and beginMount keeps a retry against the same target from
 	// forking a fresh one each time — so at most one such goroutine lingers per target,
 	// and it drains on its own when the portal recovers or the mount fails.
-	att := beginMount(targetPath, func() error {
+	att := beginMount(mountAttemptKey(sourcePath, targetPath, mo), func() error {
 		return mounter.Mount(sourcePath, targetPath, "nfs", mo)
 	})
 	select {
@@ -776,28 +785,57 @@ func ResolveFQDN(fqdn string) (string, error) {
 	return ips[0].String(), nil
 }
 
-// Wrapper function to check mount status safely
+func unescapeMountInfoPath(path string) string {
+	return strings.NewReplacer(
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+		`\134`, `\`,
+	).Replace(path)
+}
+
+func mountInfoContains(reader io.Reader, targetPath string) (bool, error) {
+	targetPath = filepath.Clean(targetPath)
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		// mountinfo fields 1-6 are fixed; field 5 is the mount point.
+		if len(fields) >= 6 && filepath.Clean(unescapeMountInfoPath(fields[4])) == targetPath {
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read mountinfo: %w", err)
+	}
+	return false, nil
+}
+
+// SafeIsMountPoint checks /proc/self/mountinfo instead of stat-ing the target
+// through mount-utils. stat(2) can block forever in D-state on a stale hard NFS
+// mount, leaking one OS-thread-pinned goroutine per timeout. mountinfo is local
+// kernel metadata and does not enter the mounted filesystem.
 func SafeIsMountPoint(path string) (bool, error) {
-	type result struct {
-		mounted bool
-		err     error
+	mountInfo, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false, fmt.Errorf("open mountinfo: %w", err)
 	}
-
-	resultChan := make(chan result, 1)
-	// Use provided timeout if set, otherwise default to 1 minute
-	to := defaultMountCheckTimeout
-	go func() {
-		mounted, err := mount.New("").IsMountPoint(path)
-		resultChan <- result{mounted, err}
-	}()
-
-	select {
-	case res := <-resultChan:
-		return res.mounted, res.err
-	case <-time.After(to):
-		go func() { <-resultChan }() // drain the channel later so goroutine can exit
-		return false, context.DeadlineExceeded
+	mounted, err := mountInfoContains(mountInfo, path)
+	closeErr := mountInfo.Close()
+	if err != nil {
+		return false, err
 	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	if mounted {
+		return true, nil
+	}
+	// Preserve the old caller contract: a missing, non-mounted target returns an
+	// os.IsNotExist-compatible error so the caller can create it.
+	if _, err := os.Lstat(path); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // MakeEmptyRawFolder creates a folder at the specified path

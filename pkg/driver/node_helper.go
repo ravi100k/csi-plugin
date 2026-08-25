@@ -21,33 +21,39 @@ import (
 
 // Mount share and attach it
 func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, targetPath string, mountFlags []string, fqdn string) error {
-	// Step 0 — Ensure root share mount exists for this volume (lazy stage for old volumes)
-	// Lazy stage for old volumes (skip if root share already mounted)
-	rootShareMounted, _ := common.SafeIsMountPoint(common.BaseBackingShareMountPath)
-	if !rootShareMounted {
-		log.Infof("[LazyStage] Root share not mounted — performing stage for old volume %s", volumeId)
-
-		// Create marker file (same as NodeStageVolume)
+	// Step 0 — Ensure root share mount and this volume's marker exist atomically
+	// with NodeStage/NodeUnstage. Older PVs can reach publish without a prior
+	// stage, and they still need a marker even when another volume already mounted
+	// the shared root export.
+	if err := func() error {
+		d.nodeStageMu.Lock()
+		defer d.nodeStageMu.Unlock()
 		if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-			log.Warnf("Failed to create marker root directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
+			return status.Errorf(codes.Internal, "failed to create marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
 		}
 		marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeId)
 		if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
-			log.Warnf("Not able to create marker file path %s err %v", marker, err)
+			return status.Errorf(codes.Internal, "failed to create volume marker %s: %v", marker, err)
 		}
 
-		// Mount root export (same as NodeStageVolume)
-		if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, fqdn); err != nil {
-			return status.Errorf(codes.Internal, "[LazyStage] root export mount failed: %v", err)
-		}
+		rootShareMounted, _ := common.SafeIsMountPoint(common.BaseBackingShareMountPath)
+		if !rootShareMounted {
+			log.Infof("[LazyStage] Root share not mounted — performing stage for old volume %s", volumeId)
+			if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, fqdn); err != nil {
+				_ = os.Remove(marker)
+				return status.Errorf(codes.Internal, "[LazyStage] root export mount failed: %v", err)
+			}
 
-		// Clear old mount because now this will come up with bind mount.
-		// This meant the the publish was not from bind mount, so remove old share mount to clear old direct nfs mount and do bind mount from here.
-		log.Debugf("Strating unmouting for target path %s, due to old style mount from v1.2.7 and earlier", targetPath)
-		if err := common.UnmountFilesystem(ctx, targetPath); err != nil {
-			log.Warnf("Not able to clear the old mount point targetpath (%s) volumeid (%s)", targetPath, volumeId)
+			// Clear an old direct NFS target before replacing it with a bind mount.
+			log.Debugf("Starting unmount for legacy target path %s", targetPath)
+			if err := common.UnmountFilesystem(ctx, targetPath); err != nil {
+				log.Warnf("Unable to clear legacy target path %s for volume %s", targetPath, volumeId)
+			}
+			log.Infof("[LazyStage] Completed mounting base HS share for volume %s", volumeId)
 		}
-		log.Infof("[LazyStage] Completed mounting base HS share for volume %s", volumeId)
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	// Step 1 create a targetpath
@@ -177,7 +183,6 @@ func (d *CSIDriver) publishShareBackedDirBasedVolume(ctx context.Context, backin
 
 	if err := common.BindMountDevice(sourceMountPoint, targetPath); err != nil {
 		log.Errorf("bind mount failed for %s: %v", targetPath, err)
-		CleanupLoopDevice(ctx, targetPath)
 		d.UnmountBackingShareIfUnused(ctx, backingShareName)
 		return err
 	}
@@ -282,7 +287,9 @@ func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareNam
 		deviceStr, err := AttachLoopDeviceWithRetry(filePath, readOnly)
 		if err != nil {
 			log.Errorf("failed to attach loop device: %v", err)
-			CleanupLoopDevice(ctx, deviceStr)
+			if deviceStr != "" {
+				CleanupLoopDevice(ctx, deviceStr)
+			}
 			d.UnmountBackingShareIfUnused(ctx, backingShareName)
 			return status.Errorf(codes.Internal, common.LoopDeviceAttachFailed, deviceStr, filePath)
 		}
@@ -317,8 +324,12 @@ func (d *CSIDriver) unpublishFileBackedVolume(ctx context.Context, volumePath, t
 	))
 	defer span.End()
 
-	//determine backing share
-	backingShareName := filepath.Dir(volumePath)
+	// Volume IDs are paths such as /backing-share/volume-file. Keep the lock and
+	// API key byte-identical to the bare backing-share name used by publish.
+	backingShareName := backingShareNameFromVolumeID(volumePath)
+	if backingShareName == "" {
+		return status.Errorf(codes.InvalidArgument, "cannot determine backing share from volume ID %q", volumePath)
+	}
 
 	unlock, err := d.acquireVolumeLock(ctx, backingShareName)
 	if err != nil {
@@ -327,12 +338,14 @@ func (d *CSIDriver) unpublishFileBackedVolume(ctx context.Context, volumePath, t
 	}
 	defer unlock()
 
-	deviceMinor, err := common.GetDeviceMinorNumber(targetPath)
+	filePath := common.ShareStagingDir + volumePath
+	lodevice, err := loopDeviceForBackingFile(filePath)
 	if err != nil {
-		log.Errorf("could not determine corresponding device path for target path, %s, %v", targetPath, err)
-		return status.Error(codes.Internal, err.Error())
+		return status.Errorf(codes.Internal, "could not find loop device for %s: %v", filePath, err)
 	}
-	lodevice := fmt.Sprintf("/dev/loop%d", deviceMinor)
+	if lodevice == "" {
+		return status.Errorf(codes.Internal, "no loop device found for backing file %s", filePath)
+	}
 	log.Infof("found device %s for mount %s", lodevice, targetPath)
 
 	// Remove bind mount
@@ -342,18 +355,16 @@ func (d *CSIDriver) unpublishFileBackedVolume(ctx context.Context, volumePath, t
 		return status.Error(codes.Internal, err.Error())
 	}
 	log.Infof("unmounted the targetPath %s. Command output %v ", targetPath, output)
-	// delete target path
-	err = os.Remove(targetPath)
-	if err != nil {
-		log.Errorf("could not remove target path, %v", err)
+	// Detach before deleting the target. If detach fails, leaving the target in
+	// place ensures kubelet retries this cleanup instead of treating a missing
+	// target as successful while the loop device remains pinned.
+	log.Infof("detaching loop device, %s", lodevice)
+	if err = detachLoopDevice(ctx, lodevice); err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	// detach from loopback device
-	log.Infof("detaching loop device, %s", lodevice)
-	output, err = common.ExecCommand("losetup", "-d", lodevice)
-	if err != nil {
-		log.Errorf("%s, %v", output, err.Error())
+	if err = os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		log.Errorf("could not remove target path, %v", err)
 		return status.Error(codes.Internal, err.Error())
 	}
 

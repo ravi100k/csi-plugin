@@ -167,6 +167,7 @@ Currently, only the ``topology.csi.hammerspace.com/is-data-portal`` key is suppo
 * Docker
 * Golang 1.12+
 * nfs-utils
+* [Trivy](https://trivy.dev/latest/getting-started/installation/) (required for release builds)
 
 ### Building
 ##### Build a new docker image from local source:
@@ -177,6 +178,21 @@ Update VERSION file, then
 
 ```bash
 make build-release
+```
+
+The release build is scanned with Trivy and fails if the image contains HIGH or
+CRITICAL vulnerabilities. Release builds pull the latest base image and bypass
+the Docker build cache so current operating-system security updates are applied.
+To scan an already-built release image, run:
+
+```bash
+make scan-release
+```
+
+The image and severity threshold can be overridden when needed:
+
+```bash
+make scan-release RELEASE_IMAGE=example.com/csi-plugin:tag TRIVY_SEVERITY=CRITICAL
 ```
 
 ##### Publish a new release

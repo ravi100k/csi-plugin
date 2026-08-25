@@ -193,6 +193,8 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 	if volumeCapability == nil {
 		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
 	}
+	d.nodeStageMu.Lock()
+	defer d.nodeStageMu.Unlock()
 
 	log.WithFields(log.Fields{
 		"volume_id":      volumeID,
@@ -207,19 +209,20 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 	// Step 1: Create a marker file for each new volume comming in.
 	// Create marker for this volume
 	if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-		log.Warnf("Failed to create marker root directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
+		return nil, status.Errorf(codes.Internal, "failed to create marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
 	}
 
 	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
 
 	err = os.WriteFile(marker, []byte(""), 0644)
 	if err != nil {
-		log.Warnf("Not able to create marker file path %s err %v", marker, err)
+		return nil, status.Errorf(codes.Internal, "failed to create volume marker %s: %v", marker, err)
 	}
 
 	// Step 2: Ensure the root NFS export is mounted once per node
 	// EnsureRootExportMounted function will do a mount check before mounting or creating dir.
 	if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, volumeContext["fqdn"]); err != nil {
+		_ = os.Remove(marker)
 		return nil, status.Errorf(codes.Internal, "root export mount failed: %v", err)
 	}
 
@@ -244,6 +247,8 @@ func (d *CSIDriver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageV
 	if stagingTarget == "" {
 		return nil, status.Error(codes.InvalidArgument, "Staging target path missing")
 	}
+	d.nodeStageMu.Lock()
+	defer d.nodeStageMu.Unlock()
 
 	log.WithFields(log.Fields{
 		"volume_id":      volumeID,
@@ -255,14 +260,24 @@ func (d *CSIDriver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageV
 
 	// 1. Delete marker.txt for this volume
 	log.Debugf("Removing volume marker %s", marker)
-	_ = os.Remove(marker)
+	if removeErr := os.Remove(marker); removeErr != nil && !os.IsNotExist(removeErr) {
+		return nil, status.Errorf(codes.Internal, "failed to remove volume marker %s: %v", marker, removeErr)
+	}
 	log.Debugf("Removed volume marker %s", marker)
 	// 2. If marker tree is now empty, clean up root
-	if !IsAnyVolumeStillMounted(common.BaseVolumeMarkerSourcePath) {
+	stillMounted, markerErr := IsAnyVolumeStillMounted(common.BaseVolumeMarkerSourcePath)
+	if markerErr != nil {
+		return nil, status.Errorf(codes.Internal, "failed to inspect volume markers: %v", markerErr)
+	}
+	if !stillMounted {
 		// if no volume are mounted
 		log.Debugf("No volume marker is present on this node. Remove root mount as well..")
-		_ = os.RemoveAll(common.BaseVolumeMarkerSourcePath)
-		_ = common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath)
+		if unmountErr := common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath); unmountErr != nil {
+			return nil, unmountErr
+		}
+		if removeErr := os.RemoveAll(common.BaseVolumeMarkerSourcePath); removeErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to remove marker directory: %v", removeErr)
+		}
 	}
 	log.WithFields(log.Fields{
 		"volume_id":      volumeID,
@@ -448,6 +463,18 @@ func (d *CSIDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubl
 		if err := common.UnmountFilesystem(ctx, targetPath); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
+		// A multi-segment volume ID is backed by a staging share, whether it is
+		// exposed as NFS directory or as a filesystem in a backing file. Release
+		// that share after the target mount is gone; native share IDs have only
+		// one segment and use the root-export staging path instead.
+		if isFileBackedVolumeID(req.GetVolumeId()) {
+			backingShareName := backingShareNameFromVolumeID(req.GetVolumeId())
+			if backingShareName != "" {
+				if _, unmountErr := d.UnmountBackingShareIfUnused(ctx, backingShareName); unmountErr != nil {
+					return nil, status.Errorf(codes.Internal, "failed to release backing share %s: %v", backingShareName, unmountErr)
+				}
+			}
+		}
 	default:
 		// Unknown file type, attempt cleanup
 		log.Warnf("Target path %s exists but is not a block device nor directory. Removing...", targetPath)
@@ -467,13 +494,6 @@ func (d *CSIDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCap
 
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
-			{
-				Type: &csi.NodeServiceCapability_Rpc{
-					Rpc: &csi.NodeServiceCapability_RPC{
-						Type: csi.NodeServiceCapability_RPC_UNKNOWN,
-					},
-				},
-			},
 			{
 				Type: &csi.NodeServiceCapability_Rpc{
 					Rpc: &csi.NodeServiceCapability_RPC{
@@ -500,6 +520,9 @@ func (d *CSIDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCap
 }
 
 func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
+	}
 
 	var requestedSize int64
 	if req.GetCapacityRange().GetLimitBytes() != 0 {
@@ -566,6 +589,8 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 			CapacityBytes: requestedSize,
 		}, nil
 	} else {
-		return nil, nil
+		// NFS/share-backed volumes are expanded on the controller and require no
+		// node-side filesystem operation, but CSI still requires a response.
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: requestedSize}, nil
 	}
 }

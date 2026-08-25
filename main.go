@@ -41,6 +41,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 // DefaultLogLevel is the level used when LOG_LEVEL is unset or invalid.
@@ -190,12 +195,17 @@ func validateEnvironmentVars() {
 			os.Exit(1)
 		}
 	}
-
-	if os.Getenv("CSI_MAJOR_VERSION") != "0" || os.Getenv("CSI_MAJOR_VERSION") != "1" {
-		if err != nil {
-			log.Error("CSI_MAJOR_VERSION must be set to \"0\" or \"1\"")
+	if caBundle := os.Getenv("HS_CA_BUNDLE"); caBundle != "" {
+		if _, statErr := os.Stat(caBundle); statErr != nil {
+			log.Errorf("HS_CA_BUNDLE must reference a readable CA bundle: %v", statErr)
 			os.Exit(1)
 		}
+	}
+
+	csiMajorVersion := os.Getenv("CSI_MAJOR_VERSION")
+	if csiMajorVersion != "0" && csiMajorVersion != "1" {
+		log.Error("CSI_MAJOR_VERSION must be set to \"0\" or \"1\"")
+		os.Exit(1)
 	}
 
 	common.DataPortalMountPrefix = os.Getenv("HS_DATA_PORTAL_MOUNT_PREFIX")
@@ -204,6 +214,70 @@ func validateEnvironmentVars() {
 type Server interface {
 	Start(net.Listener) error
 	Stop()
+}
+
+func runControllerLeaderElection(csiDriver *driver.CSIDriver) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("controller leader election requires in-cluster Kubernetes configuration: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		log.Fatalf("create Kubernetes client for leader election: %v", err)
+	}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "kube-system"
+	}
+	identity := os.Getenv("POD_NAME")
+	if identity == "" {
+		identity, err = os.Hostname()
+		if err != nil {
+			log.Fatalf("determine leader-election identity: %v", err)
+		}
+	}
+	lockName := os.Getenv("CSI_LEADER_ELECTION_LEASE_NAME")
+	if lockName == "" {
+		lockName = "hammerspace-csi-controller"
+	}
+
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{Name: lockName, Namespace: namespace},
+		Client:    clientset.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: identity,
+		},
+	}
+	leaderelection.RunOrDie(context.Background(), leaderelection.LeaderElectionConfig{
+		Lock:            lock,
+		LeaseDuration:   15 * time.Second,
+		RenewDeadline:   10 * time.Second,
+		RetryPeriod:     2 * time.Second,
+		ReleaseOnCancel: true,
+		Name:            "hammerspace-csi-controller",
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(leaderCtx context.Context) {
+				recoveryCtx, cancel := context.WithTimeout(leaderCtx, 2*time.Minute)
+				if err := csiDriver.RecoverFrozenTargets(recoveryCtx); err != nil {
+					log.Errorf("frozen-target recovery completed with errors: %v", err)
+				}
+				cancel()
+				csiDriver.SetControllerLeader(true)
+				log.Infof("acquired controller leadership as %s", identity)
+			},
+			OnStoppedLeading: func() {
+				csiDriver.SetControllerLeader(false)
+				// Continuing after losing the lease could permit two controllers to
+				// mutate backend state. Terminate so Kubernetes restarts the pod.
+				log.Fatal("lost controller leadership")
+			},
+			OnNewLeader: func(newIdentity string) {
+				if newIdentity != identity {
+					log.Infof("controller leader is now %s", newIdentity)
+				}
+			},
+		},
+	})
 }
 
 func main() {
@@ -221,6 +295,15 @@ func main() {
 		os.Getenv("HS_PASSWORD"),
 		os.Getenv("HS_TLS_VERIFY"),
 	)
+	if os.Getenv("CSI_NODE_NAME") == "" {
+		leaderElection, parseErr := strconv.ParseBool(os.Getenv("CSI_LEADER_ELECTION"))
+		if parseErr == nil && leaderElection {
+			// Close the startup window before the election goroutine is scheduled:
+			// controller RPCs remain gated until this replica owns the Lease.
+			csiDriver.EnableControllerLeaderElection()
+			go runControllerLeaderElection(csiDriver)
+		}
+	}
 
 	if CSI_version == "0" {
 		server = driver.NewCSIDriver_v0Support(csiDriver)

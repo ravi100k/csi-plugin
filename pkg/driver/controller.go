@@ -247,13 +247,15 @@ func (d *CSIDriver) ensureNFSDirectoryExists(ctx context.Context, backingShareNa
 	targetPath := common.ShareStagingDir + backingShare.ExportPath
 	deviceFile := targetPath + "/" + hsVolume.Name
 
-	// mount the share to create the directory
-	defer d.UnmountBackingShareIfUnused(ctx, backingShare.Name)
-	err = d.EnsureBackingShareMounted(ctx, backingShare.Name, hsVolume) // check if share is mounted
-	if err != nil {
+	// Hold a backing-mount reference for the entire directory creation. A bare
+	// EnsureBackingShareMounted call can race the last release from another
+	// operation and create the directory on the controller's local staging path
+	// after the NFS share has been unmounted.
+	if err = d.acquireBackingMount(ctx, backingShare, hsVolume); err != nil {
 		log.Errorf("failed to ensure backing share is mounted, %v", err)
 		return err
 	}
+	defer d.releaseBackingMount(ctx, backingShare)
 
 	// create NFS directory inside base share
 	err = common.MakeEmptyRawFolder(deviceFile)
@@ -915,13 +917,19 @@ func (d *CSIDriver) deleteFileBackedVolume(ctx context.Context, filepath string)
 		attribute.String("file.path", filepath),
 	))
 	defer span.End()
-	var exists bool
-	if exists, _ = d.hsclient.DoesFileExist(ctx, filepath); exists {
+	exists, err := d.hsclient.DoesFileExist(ctx, filepath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to check whether volume exists: %v", err)
+	}
+	if exists {
 		log.Infof("found file-backed volume to delete, %s", filepath)
 	}
 
 	// Check if file has snapshots and fail
-	snaps, _ := d.hsclient.GetFileSnapshots(ctx, filepath)
+	snaps, err := d.hsclient.GetFileSnapshots(ctx, filepath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to list snapshots for volume: %v", err)
+	}
 	if len(snaps) > 0 {
 		return status.Errorf(codes.FailedPrecondition, common.VolumeDeleteHasSnapshots)
 	}
@@ -1065,6 +1073,12 @@ func (d *CSIDriver) ControllerUnpublishVolume(ctx context.Context, req *csi.Cont
 }
 
 func (d *CSIDriver) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, common.VolumeNotFound)
+	}
+	if req.GetCapacityRange() == nil {
+		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
+	}
 	var requestedSize int64
 	if req.GetCapacityRange().GetLimitBytes() != 0 {
 		requestedSize = req.GetCapacityRange().GetLimitBytes()
@@ -1078,9 +1092,18 @@ func (d *CSIDriver) ControllerExpandVolume(ctx context.Context, req *csi.Control
 	))
 	defer span.End()
 
-	if req.GetVolumeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, common.VolumeNotFound)
+	if requestedSize <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "requested capacity must be greater than zero")
 	}
+
+	// Serialize expand with delete and duplicate expansion for this exact CSI
+	// volume. The backend update is read-modify-write and must not race another
+	// driver operation for the same volume.
+	unlock, err := d.acquireVolumeLock(ctx, req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	// Decide file-backed vs share-backed structurally from the volume ID, avoiding
 	// a GetShare probe that always 404s for file-backed volumes. The branches below
@@ -1149,25 +1172,34 @@ func (d *CSIDriver) ControllerExpandVolume(ctx context.Context, req *csi.Control
 			return nil, status.Error(codes.NotFound, common.VolumeNotFound)
 		}
 		share, err := d.hsclient.GetShare(ctx, shareName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to read share size: %v", err)
+		}
 		if share == nil {
 			return nil, status.Error(codes.NotFound, common.ShareNotFound)
 		}
-		var currentSize int64
-		if err != nil {
-			currentSize = 0
-		} else {
-			currentSize = share.Space.Available
-		}
 
-		if currentSize < requestedSize {
+		// share.Size is the configured total quota. Space.Available is free
+		// capacity and must never be compared with the requested total size: doing
+		// so can overwrite a larger out-of-band quota with a smaller value.
+		currentLimit := share.Size
+		if currentLimit == 0 {
+			// A zero limit means the share is unlimited; no backend resize is needed.
+			return &csi.ControllerExpandVolumeResponse{
+				CapacityBytes:         requestedSize,
+				NodeExpansionRequired: false,
+			}, nil
+		}
+		if currentLimit < requestedSize {
 			err = d.hsclient.UpdateShareSize(ctx, shareName, requestedSize)
 			if err != nil {
-				return nil, status.Error(codes.Internal, common.UnknownError)
+				return nil, status.Errorf(codes.Internal, "failed to expand share: %v", err)
 			}
+			currentLimit = requestedSize
 		}
 
 		return &csi.ControllerExpandVolumeResponse{
-			CapacityBytes:         requestedSize,
+			CapacityBytes:         currentLimit,
 			NodeExpansionRequired: false,
 		}, nil
 	}
@@ -1310,7 +1342,9 @@ func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 		case *csi.VolumeCapability_Mount:
 			filesystemRequested = true
 			fsType = cap.GetMount().FsType
-			if fsType != "nfs" {
+			// The external provisioner commonly leaves FsType empty for the
+			// default share-backed StorageClass. CreateVolume treats that as NFS.
+			if fsType != "" && fsType != "nfs" {
 				fileBacked = true
 			}
 		}

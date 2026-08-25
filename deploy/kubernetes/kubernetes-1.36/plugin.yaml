@@ -24,6 +24,14 @@ spec:
     - Persistent
   storageCapacity: true
 
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hammerspace-csi-frozen-targets
+  namespace: kube-system
+data: {}
+
 #### Controller Service
 ---
 # needed for StatefulSet
@@ -153,9 +161,19 @@ spec:
                   name: com.hammerspace.csi.credentials
                   key: endpoint
             - name: HS_TLS_VERIFY
-              value: "false"
+              value: "true"
             - name: CSI_MAJOR_VERSION
               value: "1"
+            - name: CSI_LEADER_ELECTION
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             # Log verbosity: panic, fatal, error, warn, info, debug, trace.
             # debug logs every Anvil REST call — use it for troubleshooting,
             # not steady-state operation.
@@ -205,6 +223,10 @@ rules:
     resources: ["pods/exec"]
     verbs: ["create"]
   - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["hammerspace-csi-frozen-targets"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "patch", "list", "watch", "create", "delete", "update"]
   - apiGroups: [""]
@@ -213,6 +235,9 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
@@ -364,7 +389,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: HS_TLS_VERIFY
-              value: "false"
+              value: "true"
             - name: CSI_MAJOR_VERSION
               value: "1"
             # Log verbosity: panic, fatal, error, warn, info, debug, trace.

@@ -3,6 +3,7 @@ package common
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -166,6 +167,46 @@ func TestBeginMountDeduplicatesByTarget(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&starts); got != 2 {
 		t.Fatalf("post-completion mount fn didn't run fresh; starts=%d want 2", got)
+	}
+}
+
+func TestMountAttemptKeyAllowsPortalFailover(t *testing.T) {
+	mountInFlightMu.Lock()
+	mountInFlight = map[string]*inFlightMount{}
+	mountInFlightMu.Unlock()
+
+	const target = "/mnt/volume"
+	release := make(chan struct{})
+	first := beginMount(mountAttemptKey("10.0.0.1:/share", target, []string{"vers=4.2"}), func() error {
+		<-release
+		return nil
+	})
+	second := beginMount(mountAttemptKey("10.0.0.2:/share", target, []string{"vers=4.2"}), func() error {
+		return nil
+	})
+	if first == second {
+		t.Fatal("different portal sources were incorrectly deduplicated")
+	}
+	select {
+	case <-second.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback portal attempt did not run")
+	}
+	close(release)
+	<-first.done
+}
+
+func TestMountInfoContains(t *testing.T) {
+	mountInfo := strings.NewReader(
+		"36 25 0:32 / / rw,relatime - xfs /dev/root rw\n" +
+			"77 36 0:55 / /mnt/hammerspace\\040data rw,relatime - nfs 10.0.0.1:/share rw\n",
+	)
+	mounted, err := mountInfoContains(mountInfo, "/mnt/hammerspace data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mounted {
+		t.Fatal("escaped NFS mount point was not found")
 	}
 }
 

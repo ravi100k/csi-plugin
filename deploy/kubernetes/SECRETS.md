@@ -122,6 +122,37 @@ kubectl create secret generic com.hammerspace.csi.credentials \
   --from-literal=endpoint='https://<PLACEHOLDER>'
 ```
 
+## TLS verification and private certificate authorities
+
+CSI v1.4 verifies the Anvil TLS certificate by default. If Anvil uses a private
+certificate authority, create a Secret containing the PEM CA bundle:
+
+```bash
+kubectl create secret generic com.hammerspace.csi.anvil-ca \
+  --namespace kube-system \
+  --from-file=ca.crt=./anvil-ca.pem
+```
+
+Mount that key into both CSI containers and set `HS_CA_BUNDLE` to its mounted
+path. For example:
+
+```yaml
+env:
+  - name: HS_CA_BUNDLE
+    value: /etc/hammerspace-csi/tls/ca.crt
+volumeMounts:
+  - name: anvil-ca
+    mountPath: /etc/hammerspace-csi/tls
+    readOnly: true
+volumes:
+  - name: anvil-ca
+    secret:
+      secretName: com.hammerspace.csi.anvil-ca
+```
+
+`HS_TLS_VERIFY=false` remains available as a temporary migration setting, but
+it disables server identity verification and logs a security warning.
+
 To read the value from a file instead of your shell history:
 
 ```bash

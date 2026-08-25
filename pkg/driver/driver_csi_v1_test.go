@@ -5,9 +5,63 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestLogGRPCDoesNotLogRequestSecrets(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.DebugLevel)
+	defer log.SetLevel(previousLevel)
+
+	request := &csi.NodePublishVolumeRequest{
+		VolumeId: "volume-a",
+		Secrets:  map[string]string{"password": "do-not-log-this"},
+	}
+	logGRPC("/csi.v1.Node/NodePublishVolume", request, &csi.NodePublishVolumeResponse{}, nil)
+
+	entry := hook.LastEntry()
+	if entry == nil {
+		t.Fatal("expected a debug log entry")
+	}
+	if _, exists := entry.Data["request"]; exists {
+		t.Fatal("gRPC log contains serialized request field")
+	}
+	if got := entry.Data["request_type"]; got != "*csi.NodePublishVolumeRequest" {
+		t.Fatalf("request_type = %v", got)
+	}
+}
+
+func TestControllerLeaderElectionGate(t *testing.T) {
+	d := &CSIDriver{}
+	d.EnableControllerLeaderElection()
+	called := false
+	handler := func(context.Context, interface{}) (interface{}, error) {
+		called = true
+		return "ok", nil
+	}
+	info := &grpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/CreateVolume"}
+	if _, err := d.callInterceptor(context.Background(), nil, info, handler); status.Code(err) != codes.Unavailable {
+		t.Fatalf("non-leader status = %v, want Unavailable", status.Code(err))
+	}
+	if called {
+		t.Fatal("controller handler ran on a non-leader")
+	}
+
+	d.SetControllerLeader(true)
+	if _, err := d.callInterceptor(context.Background(), nil, info, handler); err != nil {
+		t.Fatalf("leader request failed: %v", err)
+	}
+	if !called {
+		t.Fatal("controller handler did not run on leader")
+	}
+}
 
 // TestAcquireAndReleaseVolumeLock ensures a lock can be acquired and released.
 func TestAcquireAndReleaseVolumeLock(t *testing.T) {
