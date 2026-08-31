@@ -17,8 +17,11 @@ limitations under the License.
 package driver
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,7 +32,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	timestamp "google.golang.org/protobuf/types/known/timestamppb"
-	"k8s.io/kubernetes/pkg/util/slice"
 
 	"context"
 
@@ -258,7 +260,12 @@ func (d *CSIDriver) ensureNFSDirectoryExists(ctx context.Context, backingShareNa
 	defer d.releaseBackingMount(ctx, backingShare)
 
 	// create NFS directory inside base share
-	err = common.MakeEmptyRawFolder(deviceFile)
+	if hsVolume.SourceVolumePath != "" {
+		sourcePath := common.ShareStagingDir + hsVolume.SourceVolumePath
+		err = common.CloneDirectoryAtomically(sourcePath, deviceFile)
+	} else {
+		err = common.MakeEmptyRawFolder(deviceFile)
+	}
 	if err != nil {
 		log.Errorf("failed to create backing folder for volume, %v", err)
 		return err
@@ -307,7 +314,7 @@ func (d *CSIDriver) ensureShareBackedVolumeExists(ctx context.Context, hsVolume 
 		}
 
 		snapshotName := path.Base(hsVolume.SourceSnapPath)
-		if !slice.ContainsString(snapshots, snapshotName, strings.TrimSpace) {
+		if !slices.Contains(snapshots, strings.TrimSpace(snapshotName)) {
 			return status.Error(codes.NotFound, common.SourceSnapshotNotFound)
 		}
 
@@ -469,6 +476,29 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 			log.Errorf("Failed to restore from snapshot, %v", err)
 			return status.Error(codes.NotFound, common.UnknownError)
 		}
+	} else if hsVolume.SourceVolumePath != "" {
+		// Hammerspace documents this endpoint as "Clone file"; it accepts a
+		// current file path as the source in addition to a snapshot path.
+		err := d.hsclient.RestoreFileSnapToDestination(ctx, hsVolume.SourceVolumePath, hsVolume.Path)
+		if err != nil {
+			return status.Errorf(codes.Internal, "clone file-backed volume: %v", err)
+		}
+		clonedFile, getErr := d.hsclient.GetFile(ctx, hsVolume.Path)
+		if getErr != nil {
+			return status.Errorf(codes.Internal, "read cloned file: %v", getErr)
+		}
+		if clonedFile == nil {
+			return status.Error(codes.Internal, "clone completed without a destination file")
+		}
+		if clonedFile.Size < hsVolume.Size {
+			if err = d.acquireBackingMount(ctx, backingShare, hsVolume); err != nil {
+				return err
+			}
+			defer d.releaseBackingMount(ctx, backingShare)
+			if err = common.ResizeRawFile(deviceFile, hsVolume.Size); err != nil {
+				return status.Errorf(codes.Internal, "grow cloned file: %v", err)
+			}
+		}
 	} else {
 		// Create empty file. Take a refcounted reference on the backing mount so it
 		// stays mounted for the duration of this create but is NOT held under the
@@ -484,21 +514,13 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 
 		log.Debugf("ensureDeviceFileExists mounted backing share %s", backingShare.Name)
 
-		err = common.MakeEmptyRawFile(ctx, deviceFile, hsVolume.Size)
+		err = common.CreateFormattedRawFileAtomically(ctx, deviceFile, hsVolume.Size, hsVolume.FSType)
 		if err != nil {
-			log.Errorf("failed to create backing file for volume, %v", err)
+			log.Errorf("failed to create and format backing file for volume, %v", err)
 			return err
 		}
 
-		// Add filesystem
-		log.Debugf("ensureDeviceFileExists created empty raw file over backing share %s and path %s", backingShare.Name, deviceFile)
-		if hsVolume.FSType != "" {
-			err = common.FormatDevice(ctx, deviceFile, hsVolume.FSType)
-			if err != nil {
-				log.Errorf("failed to format volume, %v", err)
-				return err
-			}
-		}
+		log.Debugf("ensureDeviceFileExists atomically created raw file over backing share %s and path %s", backingShare.Name, deviceFile)
 		log.Infof("ensureDeviceFileExists formatted file %s, with fstype %s", deviceFile, hsVolume.FSType)
 	}
 
@@ -658,6 +680,10 @@ func (d *CSIDriver) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 	// Check for snapshot source specified
 	cs := req.VolumeContentSource
 	snap := cs.GetSnapshot()
+	volumeSource := cs.GetVolume()
+	if snap != nil && volumeSource != nil {
+		return nil, status.Error(codes.InvalidArgument, "only one volume content source may be specified")
+	}
 
 	// Get volumeMode
 	var fsType, volumeMode string
@@ -697,14 +723,67 @@ func (d *CSIDriver) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 	// Check we have available capacity
 	cr := req.CapacityRange
 	var requestedSize int64 = 0
+	var cloneSourceShare *common.ShareResponse
+	directoryClone := volumeSource != nil && !fileBacked && fsType == "nfs" &&
+		vParams.MountBackingShareName != "" &&
+		backingShareNameFromVolumeID(volumeSource.GetVolumeId()) == vParams.MountBackingShareName
 	if cr != nil {
-		if cr.LimitBytes != 0 {
-			requestedSize = cr.LimitBytes
-		} else {
+		if cr.RequiredBytes > 0 && cr.LimitBytes > 0 && cr.RequiredBytes > cr.LimitBytes {
+			return nil, status.Error(codes.OutOfRange, "required capacity exceeds the capacity limit")
+		}
+		if cr.RequiredBytes > 0 {
 			requestedSize = cr.RequiredBytes
+		} else if cr.LimitBytes > 0 {
+			requestedSize = cr.LimitBytes
 		}
 	} else if fileBacked {
 		requestedSize = common.DefaultBackingFileSizeBytes
+	}
+
+	if volumeSource != nil {
+		if fileBacked && isFileBackedVolumeID(volumeSource.GetVolumeId()) {
+			sourceFile, sourceErr := d.hsclient.GetFile(ctx, volumeSource.GetVolumeId())
+			if sourceErr != nil {
+				return nil, status.Errorf(codes.Internal, "read clone source: %v", sourceErr)
+			}
+			if sourceFile == nil {
+				return nil, status.Error(codes.NotFound, "clone source volume not found")
+			}
+			if cr == nil || requestedSize == 0 {
+				requestedSize = sourceFile.Size
+			}
+			if requestedSize < sourceFile.Size {
+				return nil, status.Errorf(codes.OutOfRange,
+					"destination capacity %d is smaller than source capacity %d", requestedSize, sourceFile.Size)
+			}
+		} else if directoryClone {
+			sourceDir, sourceErr := d.hsclient.GetFile(ctx, volumeSource.GetVolumeId())
+			if sourceErr != nil {
+				return nil, status.Errorf(codes.Internal, "read directory clone source: %v", sourceErr)
+			}
+			if sourceDir == nil {
+				return nil, status.Error(codes.NotFound, "directory clone source volume not found")
+			}
+		} else if !fileBacked && !isFileBackedVolumeID(volumeSource.GetVolumeId()) {
+			var sourceErr error
+			cloneSourceShare, sourceErr = d.hsclient.GetShare(ctx, GetVolumeNameFromPath(volumeSource.GetVolumeId()))
+			if sourceErr != nil {
+				return nil, status.Errorf(codes.Internal, "read NFS clone source: %v", sourceErr)
+			}
+			if cloneSourceShare == nil {
+				return nil, status.Error(codes.NotFound, "NFS clone source volume not found")
+			}
+			sourceSize := cloneSourceShare.Size
+			if cr == nil || requestedSize == 0 {
+				requestedSize = sourceSize
+			}
+			if sourceSize > 0 && requestedSize > 0 && requestedSize < sourceSize {
+				return nil, status.Errorf(codes.OutOfRange,
+					"destination capacity %d is smaller than source capacity %d", requestedSize, sourceSize)
+			}
+		} else {
+			return nil, status.Error(codes.InvalidArgument, "clone source and destination volume types are incompatible")
+		}
 	}
 
 	// Reject file-backed volumes below the per-fsType minimum, failing fast with
@@ -832,6 +911,31 @@ func (d *CSIDriver) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 		hsVolume.SourceSnapShareName = sourceSnapShareName
 
 		log.Info("using snapshot as volume source")
+	} else if volumeSource != nil {
+		if !fileBacked && vParams.MountBackingShareName != "" {
+			hsVolume.SourceVolumePath = volumeSource.GetVolumeId()
+		} else if cloneSourceShare == nil {
+			hsVolume.SourceVolumePath = volumeSource.GetVolumeId()
+		} else {
+			temporarySnapshot := backendSnapshotName("clone-" + req.GetName())
+			snapshots, listErr := d.hsclient.GetShareSnapshots(ctx, cloneSourceShare.Name)
+			if listErr != nil {
+				return nil, status.Errorf(codes.Internal, "list clone-source snapshots: %v", listErr)
+			}
+			if !slices.Contains(snapshots, strings.TrimSpace(temporarySnapshot)) {
+				if _, snapErr := d.hsclient.SnapshotShare(ctx, cloneSourceShare.Name, temporarySnapshot); snapErr != nil {
+					return nil, status.Errorf(codes.Internal, "create clone-source snapshot: %v", snapErr)
+				}
+			}
+			hsVolume.SourceSnapPath = temporarySnapshot
+			hsVolume.SourceSnapShareName = cloneSourceShare.Name
+			defer func() {
+				if cleanupErr := d.hsclient.DeleteShareSnapshot(context.WithoutCancel(ctx), cloneSourceShare.Name, temporarySnapshot); cleanupErr != nil {
+					log.Errorf("clean temporary clone snapshot %s: %v", temporarySnapshot, cleanupErr)
+				}
+			}()
+		}
+		log.WithField("source_volume_id", hsVolume.SourceVolumePath).Info("using PVC as volume source")
 	}
 
 	log.Infof("Volume Mode=%s, fsType=%s, Block=%t, FileBacked=%t", volumeMode, fsType, blockRequested, fileBacked)
@@ -904,6 +1008,13 @@ func (d *CSIDriver) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 				Snapshot: &csi.VolumeContentSource_SnapshotSource{
 					SnapshotId: snap.GetSnapshotId(),
 				},
+			},
+		}
+	}
+	if volumeSource != nil {
+		resp.Volume.ContentSource = &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Volume{
+				Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: volumeSource.GetVolumeId()},
 			},
 		}
 	}
@@ -1079,11 +1190,17 @@ func (d *CSIDriver) ControllerExpandVolume(ctx context.Context, req *csi.Control
 	if req.GetCapacityRange() == nil {
 		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
 	}
-	var requestedSize int64
-	if req.GetCapacityRange().GetLimitBytes() != 0 {
-		requestedSize = req.GetCapacityRange().GetLimitBytes()
-	} else {
-		requestedSize = req.GetCapacityRange().GetRequiredBytes()
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+	capacityRange := req.GetCapacityRange()
+	if capacityRange.GetRequiredBytes() > 0 && capacityRange.GetLimitBytes() > 0 &&
+		capacityRange.GetRequiredBytes() > capacityRange.GetLimitBytes() {
+		return nil, status.Error(codes.OutOfRange, "required capacity exceeds the capacity limit")
+	}
+	requestedSize := capacityRange.GetRequiredBytes()
+	if requestedSize == 0 {
+		requestedSize = capacityRange.GetLimitBytes()
 	}
 	// Start a span for tracing
 	ctx, span := tracer.Start(ctx, "Controller/ExpandVolume", trace.WithAttributes(
@@ -1222,27 +1339,19 @@ func (d *CSIDriver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Val
 		return nil, status.Errorf(codes.InvalidArgument, common.NoCapabilitiesSupplied, req.VolumeId)
 	}
 
-	// Find Share
-	typeBlock := false
-	typeMount := false
-	fileBacked := false
+	// Resolve the provisioned object from its canonical CSI volume ID. Storage
+	// class parameters are optional on this RPC and therefore cannot be used to
+	// infer whether an existing volume is block- or mount-backed.
+	fileBacked := isFileBackedVolumeID(req.GetVolumeId())
 
 	volumeName := GetVolumeNameFromPath(req.GetVolumeId())
-	share, _ := d.hsclient.GetShare(ctx, volumeName)
-	if share != nil {
-		typeMount = true
+	share, shareErr := d.hsclient.GetShare(ctx, volumeName)
+	if shareErr != nil && !fileBacked {
+		return nil, status.Errorf(codes.Internal, "resolve volume: %v", shareErr)
 	}
-
-	vParams, err := parseVolParams(req.Parameters)
-	if err != nil {
-		return nil, err
-	}
-
-	typeBlock = vParams.BlockBackingShareName != ""
-	typeMount = vParams.MountBackingShareName != ""
 
 	//  Check if the specified backing share or file exists
-	if share == nil {
+	if fileBacked || share == nil {
 		backingFileExists, err := d.hsclient.DoesFileExist(ctx, req.GetVolumeId())
 		if err != nil {
 			log.Error(err)
@@ -1263,7 +1372,10 @@ func (d *CSIDriver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Val
 	// Calculate Capabilties
 	confirmedCapabilities := make([]*csi.VolumeCapability, 0, len(req.VolumeCapabilities))
 	for _, c := range req.VolumeCapabilities {
-		if (c.GetBlock() != nil) && typeBlock {
+		if c == nil || c.GetAccessMode() == nil {
+			continue
+		}
+		if c.GetBlock() != nil && fileBacked {
 			// We have decided to allow multi writer for block devices
 			//if c.GetAccessMode().GetMode() != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
 			confirmedCapabilities = append(confirmedCapabilities, c)
@@ -1272,8 +1384,6 @@ func (d *CSIDriver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Val
 			//if it's a file backed, do not allow multinode
 			if !(fileBacked &&
 				c.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER) {
-				confirmedCapabilities = append(confirmedCapabilities, c)
-			} else if typeMount {
 				confirmedCapabilities = append(confirmedCapabilities, c)
 			}
 		}
@@ -1300,18 +1410,27 @@ func (d *CSIDriver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest
 			"[ListVolumes] Invalid max entries request %v, must not be negative ", req.MaxEntries))
 	}
 
-	vlist, err := d.hsclient.ListVolumes(ctx)
+	vlist, err := d.hsclient.ListShares(ctx)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("ListVolumes failed: %v", err))
 	}
 
-	ventries := make([]*csi.ListVolumesResponse_Entry, 0, len(vlist))
+	sort.Slice(vlist, func(i, j int) bool { return vlist[i].ExportPath < vlist[j].ExportPath })
+	start, err := paginationStart(req.GetStartingToken(), len(vlist))
+	if err != nil {
+		return nil, err
+	}
+	end := len(vlist)
+	if req.GetMaxEntries() > 0 && end-start > int(req.GetMaxEntries()) {
+		end = start + int(req.GetMaxEntries())
+	}
+	ventries := make([]*csi.ListVolumesResponse_Entry, 0, end-start)
 	publishedNodeIds := make([]string, 0, len(ventries))
-	for _, v := range vlist {
+	for _, v := range vlist[start:end] {
 		ventry := csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
-				VolumeId:      v.Name,
-				CapacityBytes: v.Capacity,
+				VolumeId:      v.ExportPath,
+				CapacityBytes: v.Size,
 			},
 			Status: &csi.ListVolumesResponse_VolumeStatus{
 				PublishedNodeIds: publishedNodeIds,
@@ -1320,9 +1439,27 @@ func (d *CSIDriver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest
 
 		ventries = append(ventries, &ventry)
 	}
-	return &csi.ListVolumesResponse{
-		Entries: ventries,
-	}, nil
+	nextToken := ""
+	if end < len(vlist) {
+		nextToken = strconv.Itoa(end)
+	}
+	return &csi.ListVolumesResponse{Entries: ventries, NextToken: nextToken}, nil
+}
+
+func paginationStart(token string, total int) (int, error) {
+	if token == "" {
+		return 0, nil
+	}
+	start, err := strconv.Atoi(token)
+	if err != nil || start < 0 || start > total {
+		return 0, status.Error(codes.Aborted, "invalid starting token")
+	}
+	return start, nil
+}
+
+func backendSnapshotName(csiName string) string {
+	sum := sha256.Sum256([]byte(csiName))
+	return fmt.Sprintf("csi-%x", sum[:])
 }
 
 func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
@@ -1405,6 +1542,13 @@ func (d *CSIDriver) ControllerGetCapabilities(ctx context.Context, req *csi.Cont
 		{
 			Type: &csi.ControllerServiceCapability_Rpc{
 				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+				},
+			},
+		},
+		{
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
 					Type: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 				},
 			},
@@ -1477,6 +1621,32 @@ func (d *CSIDriver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotR
 	}
 	defer unlock()
 
+	if d.snapshotState != nil {
+		record, stateErr := d.snapshotState.Get(ctx, req.GetName())
+		if stateErr != nil {
+			return nil, status.Errorf(codes.Internal, "read persistent snapshot state: %v", stateErr)
+		}
+		if record != nil {
+			if record.SourceVolumeID != req.GetSourceVolumeId() {
+				return nil, status.Error(codes.AlreadyExists, "snapshot name already belongs to a different source volume")
+			}
+			exists, validateErr := d.snapshotBackendExists(ctx, record.SnapshotID, record.SourceVolumeID)
+			if validateErr != nil {
+				return nil, status.Errorf(codes.Internal, "validate persisted snapshot: %v", validateErr)
+			}
+			if exists {
+				created := time.Unix(0, record.CreationUnixNano)
+				return &csi.CreateSnapshotResponse{Snapshot: &csi.Snapshot{
+					SnapshotId: record.SnapshotID, SourceVolumeId: record.SourceVolumeID,
+					CreationTime: timestamp.New(created), ReadyToUse: true,
+				}}, nil
+			}
+			if deleteErr := d.snapshotState.DeleteBySnapshotID(ctx, record.SnapshotID); deleteErr != nil {
+				return nil, status.Errorf(codes.Internal, "remove stale snapshot state: %v", deleteErr)
+			}
+		}
+	}
+
 	// FIXME: Check to see if snapshot already exists?
 	//  (using their id somehow?, update the share extended info maybe?) what about for file-backed volumes?
 	// do we update extended info on backing share?
@@ -1522,11 +1692,25 @@ func (d *CSIDriver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotR
 			// Always unfreeze, even if snapshot creation or a fallback lookup fails.
 			// Detach from the gRPC request so cancellation cannot leave the workload frozen.
 			defer d.freezer.Unfreeze(context.WithoutCancel(ctx), frozen)
+			stopWatchdog := d.freezer.StartWatchdog(frozen)
+			defer stopWatchdog()
 		}
 		// Create the snapshot.
 		var hsSnapName string
 		if !fileBackedSource {
-			hsSnapName, err = d.hsclient.SnapshotShare(ctx, volumeName)
+			// The Hammerspace v1.2 API accepts snapshot-name for share snapshots.
+			// A deterministic backend name makes retries safe across process and
+			// leader restarts without relying on controller-local memory.
+			expectedName := backendSnapshotName(req.GetName())
+			existing, listErr := d.hsclient.GetShareSnapshots(ctx, volumeName)
+			if listErr != nil {
+				return nil, status.Errorf(codes.Internal, "list share snapshots: %v", listErr)
+			}
+			if slices.Contains(existing, strings.TrimSpace(expectedName)) {
+				hsSnapName = expectedName
+			} else {
+				hsSnapName, err = d.hsclient.SnapshotShare(ctx, volumeName, expectedName)
+			}
 			if err == nil {
 				snapID = GetSnapshotIDFromSnapshotName(hsSnapName, sourceVolumeID)
 			}
@@ -1556,6 +1740,17 @@ func (d *CSIDriver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotR
 		recentlyCreatedSnapshots[req.GetName()] = snapshotResponse
 		recentlyCreatedSnapshotsMu.Unlock()
 		cachedSnapshot = snapshotResponse
+		if d.snapshotState != nil {
+			record := snapshotRecord{
+				Name: req.GetName(), SnapshotID: snapID, SourceVolumeID: sourceVolumeID,
+				CreationUnixNano: now.UnixNano(),
+			}
+			if stateErr := d.snapshotState.Save(context.WithoutCancel(ctx), record); stateErr != nil {
+				// The snapshot exists and must be returned to the CO. Keep the
+				// process-local entry and surface the durability failure loudly.
+				log.Errorf("persist snapshot idempotency record for %s: %v", req.GetName(), stateErr)
+			}
+		}
 	} else {
 		if cachedSnapshot.SourceVolumeId != req.GetSourceVolumeId() {
 			return nil, status.Errorf(codes.AlreadyExists, "snapshot already exists for a different volume")
@@ -1568,6 +1763,22 @@ func (d *CSIDriver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotR
 	return &csi.CreateSnapshotResponse{
 		Snapshot: cachedSnapshot,
 	}, nil
+}
+
+func (d *CSIDriver) snapshotBackendExists(ctx context.Context, snapshotID, sourceVolumeID string) (bool, error) {
+	snapshotName, err := GetSnapshotNameFromSnapshotId(snapshotID)
+	if err != nil {
+		return false, err
+	}
+	if isFileBackedVolumeID(sourceVolumeID) {
+		file, err := d.hsclient.GetFile(ctx, snapshotName)
+		return file != nil, err
+	}
+	snapshots, err := d.hsclient.GetShareSnapshots(ctx, GetVolumeNameFromPath(sourceVolumeID))
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(snapshots, strings.TrimSpace(snapshotName)), nil
 }
 
 func (d *CSIDriver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
@@ -1626,6 +1837,11 @@ func (d *CSIDriver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotR
 		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	if d.snapshotState != nil {
+		if stateErr := d.snapshotState.DeleteBySnapshotID(context.WithoutCancel(ctx), snapshotId); stateErr != nil {
+			return nil, status.Errorf(codes.Internal, "remove persistent snapshot state: %v", stateErr)
+		}
+	}
 
 	log.WithFields(log.Fields{
 		"snapshot_id":      snapshotId,
@@ -1651,7 +1867,7 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 	var snapshots []*csi.ListSnapshotsResponse_Entry
 
 	// Fetch all snapshots from the backend storage
-	backendSnapshots, err := d.hsclient.ListSnapshots(ctx, req.SnapshotId, req.SourceVolumeId)
+	backendSnapshots, err := d.hsclient.ListSnapshots(ctx, "", req.SourceVolumeId)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -1691,9 +1907,25 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 		// Add the snapshot entry to the response
 		snapshots = append(snapshots, snapshotEntry)
 	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].Snapshot.SnapshotId < snapshots[j].Snapshot.SnapshotId
+	})
+	start, err := paginationStart(req.GetStartingToken(), len(snapshots))
+	if err != nil {
+		return nil, err
+	}
+	end := len(snapshots)
+	if req.GetMaxEntries() > 0 && end-start > int(req.GetMaxEntries()) {
+		end = start + int(req.GetMaxEntries())
+	}
+	nextToken := ""
+	if end < len(snapshots) {
+		nextToken = strconv.Itoa(end)
+	}
 
 	// Return the ListSnapshotsResponse with filtered snapshots
 	return &csi.ListSnapshotsResponse{
-		Entries: snapshots,
+		Entries:   snapshots[start:end],
+		NextToken: nextToken,
 	}, nil
 }

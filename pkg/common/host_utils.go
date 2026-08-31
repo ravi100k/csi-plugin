@@ -287,6 +287,64 @@ func MakeEmptyRawFile(ctx context.Context, pathname string, size int64) error {
 	return nil
 }
 
+// CreateFormattedRawFileAtomically keeps an incomplete file-backed volume out
+// of its final namespace. The partial file lives in the same directory so the
+// final rename is atomic on the backing filesystem (including NFS).
+func CreateFormattedRawFileAtomically(ctx context.Context, pathname string, size int64, fsType string) (err error) {
+	partialPath := pathname + ".hscsi-partial"
+
+	// A previous controller crash may have left the deterministic partial file
+	// behind. It was never published as a CSI volume and is safe to rebuild.
+	if removeErr := os.Remove(partialPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("remove stale partial volume %q: %w", partialPath, removeErr)
+	}
+	defer func() {
+		if err != nil {
+			if removeErr := os.Remove(partialPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				log.Warnf("failed to clean partial volume %s: %v", partialPath, removeErr)
+			}
+		}
+	}()
+
+	if err = MakeEmptyRawFile(ctx, partialPath, size); err != nil {
+		return fmt.Errorf("create partial volume: %w", err)
+	}
+	if fsType != "" {
+		if err = FormatDevice(ctx, partialPath, fsType); err != nil {
+			return fmt.Errorf("format partial volume: %w", err)
+		}
+	}
+	if err = os.Rename(partialPath, pathname); err != nil {
+		return fmt.Errorf("publish completed volume: %w", err)
+	}
+	return nil
+}
+
+// CloneDirectoryAtomically copies a directory into a hidden sibling and only
+// publishes the destination after the copy completes. Source and destination
+// must be on the same backing share so rename remains atomic.
+func CloneDirectoryAtomically(source, destination string) (err error) {
+	partialPath := destination + ".hscsi-partial"
+	if err = os.RemoveAll(partialPath); err != nil {
+		return fmt.Errorf("remove stale partial directory clone: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(partialPath)
+		}
+	}()
+	if err = os.MkdirAll(partialPath, 0755); err != nil {
+		return err
+	}
+	if output, copyErr := ExecCommand("cp", "-a", filepath.Clean(source)+"/.", partialPath); copyErr != nil {
+		return fmt.Errorf("copy directory clone: %s: %w", output, copyErr)
+	}
+	if err = os.Rename(partialPath, destination); err != nil {
+		return fmt.Errorf("publish directory clone: %w", err)
+	}
+	return nil
+}
+
 func ExpandDeviceFileSize(pathname string, size int64) error {
 	log.Infof("resizing device file '%s'", pathname)
 	sizeStr := strconv.FormatInt(size, 10)
@@ -312,6 +370,14 @@ func ExpandDeviceFileSize(pathname string, size int64) error {
 	if err != nil {
 		log.Errorf("Resizing loop device '%s' failed with output '%s': '%v'", loopdev, loresize, err.Error())
 		return err
+	}
+	return nil
+}
+
+func ResizeRawFile(pathname string, size int64) error {
+	output, err := ExecCommand("qemu-img", "resize", "-fraw", pathname, strconv.FormatInt(size, 10))
+	if err != nil {
+		return fmt.Errorf("resize raw file %s: %s: %w", pathname, output, err)
 	}
 	return nil
 }

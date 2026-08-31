@@ -5,14 +5,12 @@ RELEASE_IMAGE ?= hammerspaceinc/csi-plugin:${VERSION}
 TRIVY_SEVERITY ?= HIGH,CRITICAL
 RELEASE_BUILD_FLAGS ?= --pull --no-cache
 
-.PHONY: compile clean unittest sanity build-dev build build-release build-release-image scan-release
+.PHONY: compile clean unittest sanity sanity-compile build-dev build build-release build-release-image scan-release sbom-release sign-release verify-release
 
 compile:
 	@echo "==> Building the Hammerspace CSI Driver Version ${VERSION}"
-	@env GO111MODULE=on go mod tidy
-	@env GO111MODULE=on go mod download
-	@env GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags "-X 'github.com/hammer-space/csi-plugin/pkg/common.Version=${VERSION}' -X 'github.com/hammer-space/csi-plugin/pkg/common.Githash=${GITHASH}'" -o ${NAME} ./
+	@env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		go build -mod=readonly -ldflags "-X 'github.com/hammer-space/csi-plugin/pkg/common.Version=${VERSION}' -X 'github.com/hammer-space/csi-plugin/pkg/common.Githash=${GITHASH}'" -o ${NAME} ./
 
 clean:
 	@echo "==> Cleaning"
@@ -21,11 +19,15 @@ clean:
 
 unittest:
 	@echo "==> Running tests"
-	@env go test -v -count 1 -run="[^TestSanity]" ./...
+	@env go test -v -count 1 -skip='^TestSanity$$' ./...
+
+sanity-compile:
+	@echo "==> Compiling csi-test v5 sanity suites"
+	@env go test ./test/sanity/... -run='^$$' -count=1
 
 sanity:
 	@echo "==> Running sanity functional tests"
-	@env GO111MODULE=on go test -timeout=0 -v ./test/sanity/...
+	@env go test -timeout=2h -v ./test/sanity/...
 
 build-dev:
 	@echo "==> Building Docker Image for Dev Image"
@@ -49,3 +51,15 @@ scan-release:
 	}
 	@echo "==> Scanning Docker Image ${RELEASE_IMAGE} with Trivy"
 	@trivy image --exit-code 1 --severity "${TRIVY_SEVERITY}" "${RELEASE_IMAGE}"
+
+sbom-release:
+	@command -v syft >/dev/null 2>&1 || { echo "ERROR: syft is required"; exit 1; }
+	@syft "${RELEASE_IMAGE}" -o spdx-json="hammerspace-csi-${VERSION}.spdx.json"
+
+sign-release:
+	@command -v cosign >/dev/null 2>&1 || { echo "ERROR: cosign is required"; exit 1; }
+	@cosign sign --yes "${RELEASE_IMAGE}"
+
+verify-release:
+	@$(MAKE) --no-print-directory scan-release
+	@$(MAKE) --no-print-directory sbom-release

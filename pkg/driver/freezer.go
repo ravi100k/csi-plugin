@@ -27,7 +27,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/hammer-space/csi-plugin/pkg/common"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,16 +53,18 @@ type FrozenTarget struct {
 	MountPath string `json:"mountPath"` // kubelet-managed CSI mount
 	NodeName  string `json:"nodeName"`  // used to resolve a replacement csi-node pod
 	// For diagnostics only:
-	UserPodNs   string `json:"userPodNamespace"`
-	UserPodName string `json:"userPodName"`
+	UserPodNs   string    `json:"userPodNamespace"`
+	UserPodName string    `json:"userPodName"`
+	FrozenAt    time.Time `json:"frozenAt"`
 }
 
 // Freezer holds the kube client + REST config needed to exec into pods.
 type Freezer struct {
-	clientset kubernetes.Interface
-	restCfg   *rest.Config
-	state     frozenTargetStore
-	exec      func(context.Context, FrozenTarget, string) error
+	clientset         kubernetes.Interface
+	restCfg           *rest.Config
+	state             frozenTargetStore
+	exec              func(context.Context, FrozenTarget, string) error
+	maxFreezeDuration time.Duration
 }
 
 // NewFreezer builds a Freezer from the pod's in-cluster credentials. If the
@@ -81,7 +85,15 @@ func NewFreezer() *Freezer {
 	if namespace == "" {
 		namespace = "kube-system"
 	}
-	f := &Freezer{clientset: cs, restCfg: cfg}
+	maxFreezeDuration := 2 * time.Minute
+	if configured := os.Getenv("CSI_MAX_FREEZE_DURATION"); configured != "" {
+		if parsed, parseErr := time.ParseDuration(configured); parseErr == nil && parsed > 0 {
+			maxFreezeDuration = parsed
+		} else {
+			log.Warnf("Freezer: invalid CSI_MAX_FREEZE_DURATION=%q; using %s", configured, maxFreezeDuration)
+		}
+	}
+	f := &Freezer{clientset: cs, restCfg: cfg, maxFreezeDuration: maxFreezeDuration}
 	f.state = &kubeFrozenTargetStore{clientset: cs, namespace: namespace}
 	f.exec = f.execFsfreeze
 	return f
@@ -129,6 +141,11 @@ func (f *Freezer) FreezeForVolumeHandle(ctx context.Context, volumeHandle string
 			}
 			continue
 		}
+		t.FrozenAt = time.Now()
+		if err := f.state.Save(context.WithoutCancel(ctx), t); err != nil {
+			log.Errorf("Freezer: update frozen timestamp for %s failed: %v", t.MountPath, err)
+		}
+		common.RecordFrozenTarget(ctx, 1)
 		log.Infof("Freezer: fsfreeze --freeze via %s/%s for %s/%s (path=%s) OK and persisted",
 			t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath)
 		frozen = append(frozen, t)
@@ -149,6 +166,10 @@ func (f *Freezer) Unfreeze(ctx context.Context, frozen []FrozenTarget) {
 				t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath, err)
 			continue
 		}
+		common.RecordFrozenTarget(ctx, -1)
+		if !t.FrozenAt.IsZero() {
+			common.RecordFreezeDuration(ctx, time.Since(t.FrozenAt))
+		}
 		log.Infof("Freezer: fsfreeze --unfreeze via %s/%s for %s/%s (path=%s) OK",
 			t.Namespace, t.PodName, t.UserPodNs, t.UserPodName, t.MountPath)
 		if f.state != nil {
@@ -157,6 +178,22 @@ func (f *Freezer) Unfreeze(ctx context.Context, frozen []FrozenTarget) {
 			}
 		}
 	}
+}
+
+// StartWatchdog guarantees a bounded freeze window even if the backend call
+// wedges while the controller process remains alive. Persistent state covers
+// process death; this timer covers a live but stuck leader.
+func (f *Freezer) StartWatchdog(frozen []FrozenTarget) func() {
+	if f == nil || len(frozen) == 0 || f.maxFreezeDuration <= 0 {
+		return func() {}
+	}
+	timer := time.AfterFunc(f.maxFreezeDuration, func() {
+		log.Errorf("Freezer: maximum freeze window %s exceeded; forcing unfreeze of %d target(s)", f.maxFreezeDuration, len(frozen))
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f.Unfreeze(ctx, frozen)
+	})
+	return func() { timer.Stop() }
 }
 
 func (f *Freezer) runFsfreeze(ctx context.Context, target FrozenTarget, op string) error {
@@ -170,12 +207,17 @@ func (f *Freezer) runFsfreeze(ctx context.Context, target FrozenTarget, op strin
 // store by a crashed controller. Successful entries are removed; failures stay
 // recorded for the next leadership/startup reconciliation.
 func (f *Freezer) RecoverFrozenTargets(ctx context.Context) error {
+	var recoveryErr error
+	defer common.MeasureOp(ctx, "Freeze/Recovery")(&recoveryErr)
 	if f == nil || f.state == nil {
 		return nil
 	}
 	targets, err := f.state.List(ctx)
 	if err != nil {
 		return fmt.Errorf("list persisted frozen targets: %w", err)
+	}
+	if len(targets) > 0 {
+		common.RecordFrozenTarget(ctx, int64(len(targets)))
 	}
 	var recoveryErrors []error
 	for _, target := range targets {
@@ -188,14 +230,21 @@ func (f *Freezer) RecoverFrozenTargets(ctx context.Context) error {
 			target.Namespace, target.PodName, target.Container = pod.Namespace, pod.Name, container
 		}
 		if err := f.runFsfreeze(ctx, target, "--unfreeze"); err != nil {
+			common.RecordFreezeRecovery(ctx, false)
 			recoveryErrors = append(recoveryErrors, fmt.Errorf("unfreeze %s: %w", target.MountPath, err))
 			continue
+		}
+		common.RecordFreezeRecovery(ctx, true)
+		common.RecordFrozenTarget(ctx, -1)
+		if !target.FrozenAt.IsZero() {
+			common.RecordFreezeDuration(ctx, time.Since(target.FrozenAt))
 		}
 		if err := f.state.Delete(ctx, target); err != nil {
 			recoveryErrors = append(recoveryErrors, fmt.Errorf("delete state for %s: %w", target.MountPath, err))
 		}
 	}
-	return errors.Join(recoveryErrors...)
+	recoveryErr = errors.Join(recoveryErrors...)
+	return recoveryErr
 }
 
 // findMountsForVolumeHandle returns every (csi-node-pod, mountPath) tuple

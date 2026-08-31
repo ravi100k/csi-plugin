@@ -649,7 +649,7 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 	// Iterate over each share
 	for _, share := range shares {
 		// Skip shares that don't match the provided volume_id (if specified)
-		if volume_id != "" && share.Name != volume_id {
+		if volume_id != "" && share.Name != volume_id && share.ExportPath != volume_id {
 			continue
 		}
 
@@ -670,9 +670,9 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 		// Iterate over the snapshots in the /.snapshot/ directory
 		for _, snapshotFile := range shareFile.Children {
 			snapshot := common.SnapshotResponse{
-				Id:             snapshotFile.Name,
+				Id:             fmt.Sprintf("%s|%s", snapshotFile.Name, share.ExportPath),
 				Created:        snapshotFile.CreateTime,
-				SourceVolumeId: share.Name,
+				SourceVolumeId: share.ExportPath,
 				ReadyToUse:     true, // Assume true if the snapshot exists
 				Size:           snapshotFile.Size,
 			}
@@ -1113,9 +1113,16 @@ func (client *HammerspaceClient) DeleteShare(ctx context.Context, name string, d
 	return nil
 }
 
-func (client *HammerspaceClient) SnapshotShare(ctx context.Context, shareName string) (string, error) {
+func (client *HammerspaceClient) SnapshotShare(ctx context.Context, shareName, snapshotName string) (string, error) {
+	endpoint := fmt.Sprintf("/share-snapshots/snapshot-create/%s", url.PathEscape(shareName))
+	if snapshotName != "" {
+		endpoint += "?snapshot-name=" + url.QueryEscape(snapshotName)
+	}
 	req, err := client.generateRequest(ctx, "POST",
-		fmt.Sprintf("/share-snapshots/snapshot-create/%s", url.PathEscape(shareName)), "")
+		endpoint, "")
+	if err != nil {
+		return "", err
+	}
 	statusCode, respBody, _, err := client.doRequest(ctx, *req)
 
 	if err != nil {

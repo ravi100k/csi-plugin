@@ -1,0 +1,20 @@
+{{- if .Values.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+provisioner: com.hammerspace.csi
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+parameters:
+{{ toYaml .Values.storageClass.parameters | indent 2 }}
+{{- end }}
+{{- if .Values.snapshotClass.create }}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ .Values.snapshotClass.name }}
+driver: com.hammerspace.csi
+deletionPolicy: Delete
+{{- end }}

@@ -27,47 +27,41 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/hammer-space/csi-plugin/pkg/common"
 	"github.com/hammer-space/csi-plugin/pkg/driver"
-	"github.com/kubernetes-csi/csi-test/pkg/sanity"
+	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	log "github.com/sirupsen/logrus"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 
 	. "github.com/onsi/gomega"
 )
 
-var _ = sanity.DescribeSanity("Hammerspace - NFS Volumes", func(sc *sanity.SanityContext) {
+var _ = sanity.DescribeSanity("Hammerspace - NFS Volumes", func(sc *sanity.TestContext) {
 	var (
-		cl *sanity.Cleanup
+		cl *sanity.Resources
 		c  csi.NodeClient
 		s  csi.ControllerClient
 
-		controllerPublishSupported bool
-		nodeStageSupported         bool
+		nodeStageSupported bool
 	)
 
 	BeforeEach(func() {
 		c = csi.NewNodeClient(sc.Conn)
 		s = csi.NewControllerClient(sc.Conn)
 
-		controllerPublishSupported = isControllerCapabilitySupported(
-			s,
-			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME)
 		nodeStageSupported = isNodeCapabilitySupported(c, csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME)
 		if nodeStageSupported {
 			err := createMountTargetLocation(sc.Config.StagingPath)
 			Expect(err).NotTo(HaveOccurred())
 		}
-		cl = &sanity.Cleanup{
-			Context:                    sc,
-			NodeClient:                 c,
-			ControllerClient:           s,
-			ControllerPublishSupported: controllerPublishSupported,
-			NodeStageSupported:         nodeStageSupported,
+		cl = &sanity.Resources{
+			Context:          sc,
+			NodeClient:       c,
+			ControllerClient: s,
 		}
 	})
 
 	AfterEach(func() {
-		cl.DeleteVolumes()
+		cl.Cleanup()
 	})
 
 	Describe("NFS Volume Scenario", func() {
@@ -79,7 +73,7 @@ var _ = sanity.DescribeSanity("Hammerspace - NFS Volumes", func(sc *sanity.Sanit
 			By("creating a multi node writer volume")
 			params := copyStringMap(sc.Config.TestVolumeParameters)
 			params["fsType"] = "nfs"
-			vol, err := s.CreateVolume(
+			vol, err := cl.CreateVolume(
 				context.Background(),
 				&csi.CreateVolumeRequest{
 					Name: name,
@@ -106,7 +100,6 @@ var _ = sanity.DescribeSanity("Hammerspace - NFS Volumes", func(sc *sanity.Sanit
 			Expect(vol).NotTo(BeNil())
 			Expect(vol.GetVolume()).NotTo(BeNil())
 			Expect(vol.GetVolume().GetVolumeId()).NotTo(BeEmpty())
-			cl.RegisterVolume(name, sanity.VolumeInfo{VolumeID: vol.GetVolume().GetVolumeId()})
 
 			By("publish the volume")
 			nodepubvol, err := c.NodePublishVolume(

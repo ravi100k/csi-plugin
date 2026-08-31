@@ -2,14 +2,14 @@
 # Dev Image
 # Convenience image for testing the plugin
 # The local source code directory should be mapped to "/hammerspace-csi-plugin/"
-# via a docker volume (docker run -v /source-code/:/hammerspace-csi-plugin/
+# via a Docker volume (docker run -v /source-code/:/hammerspace-csi-plugin/ ...)
 
 # Example usage:
 # docker build -t csi-dev:latest -f Dockerfile_dev .
 # docker compose -f docker-compose-dev.yml up
 
 # ---------- Stage 1: Builder ----------
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26.0-alpine@sha256:d4c4845f5d60c6a974c6000ce58ae079328d03ab7f721a0734277e69905473e5 AS builder
 
 # Install required packages
 RUN apk add --no-cache \

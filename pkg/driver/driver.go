@@ -77,7 +77,8 @@ type CSIDriver struct {
 	// captures the file bytes. Nil when the driver is not running
 	// in-cluster (local dev) — in that case snapshots are still taken but
 	// consistency is not enforced.
-	freezer *Freezer
+	freezer       *Freezer
+	snapshotState snapshotRecordStore
 	// Controller RPCs are gated when Kubernetes Lease election is enabled. The
 	// node and identity services remain available on every replica.
 	leaderElectionEnabled atomic.Bool
@@ -111,6 +112,15 @@ func NewCSIDriver(endpoint, username, password, tlsVerifyStr string) *CSIDriver 
 		NodeID:        os.Getenv("CSI_NODE_NAME"),
 		freezer:       NewFreezer(),
 	}
+	if driver.freezer != nil {
+		driver.snapshotState = &kubeSnapshotRecordStore{
+			clientset: driver.freezer.clientset,
+			namespace: os.Getenv("POD_NAMESPACE"),
+		}
+		if store, ok := driver.snapshotState.(*kubeSnapshotRecordStore); ok && store.namespace == "" {
+			store.namespace = "kube-system"
+		}
+	}
 	driver.controllerLeader.Store(true)
 	return driver
 
@@ -135,7 +145,8 @@ func (c *CSIDriver) RecoverFrozenTargets(ctx context.Context) error {
 }
 
 type keyLock struct {
-	sem *semaphore.Weighted // weight=1 → acts like a mutex
+	sem  *semaphore.Weighted // weight=1 → acts like a mutex
+	refs int                 // guarded by CSIDriver.locksMu
 }
 
 func newKeyLock() *keyLock {
@@ -159,6 +170,7 @@ func (c *CSIDriver) acquireVolumeLock(ctx context.Context, volID string) (func()
 		lk = newKeyLock()
 		c.volumeLocks[volID] = lk
 	}
+	lk.refs++
 	c.locksMu.Unlock()
 
 	probe := common.StartLockProbe(ctx, "volume")
@@ -166,12 +178,17 @@ func (c *CSIDriver) acquireVolumeLock(ctx context.Context, volID string) (func()
 	defer cancel()
 
 	if err := lk.lock(lctx); err != nil {
+		c.releaseKeyLockRef(c.volumeLocks, volID, lk)
 		probe.Failed()
 		log.WithError(err).Errorf("Error acquiring volume lock for %s", volID)
 		return nil, status.Errorf(codes.Aborted, "could not acquire volume lock for %s: %v", volID, err)
 	}
 	release := probe.Acquired()
-	return func() { lk.unlock(); release() }, nil
+	return func() {
+		lk.unlock()
+		release()
+		c.releaseKeyLockRef(c.volumeLocks, volID, lk)
+	}, nil
 }
 
 func (c *CSIDriver) acquireSnapshotLock(ctx context.Context, snapID string) (func(), error) {
@@ -182,6 +199,7 @@ func (c *CSIDriver) acquireSnapshotLock(ctx context.Context, snapID string) (fun
 		lk = newKeyLock()
 		c.snapshotLocks[snapID] = lk
 	}
+	lk.refs++
 	c.locksMu.Unlock()
 
 	probe := common.StartLockProbe(ctx, "snapshot")
@@ -189,12 +207,26 @@ func (c *CSIDriver) acquireSnapshotLock(ctx context.Context, snapID string) (fun
 	defer cancel()
 
 	if err := lk.lock(lctx); err != nil {
+		c.releaseKeyLockRef(c.snapshotLocks, snapID, lk)
 		probe.Failed()
 		log.WithError(err).Errorf("Error acquiring snapshot lock for %s", snapID)
 		return nil, status.Errorf(codes.Aborted, "could not acquire snapshot lock for %s: %v", snapID, err)
 	}
 	release := probe.Acquired()
-	return func() { lk.unlock(); release() }, nil
+	return func() {
+		lk.unlock()
+		release()
+		c.releaseKeyLockRef(c.snapshotLocks, snapID, lk)
+	}, nil
+}
+
+func (c *CSIDriver) releaseKeyLockRef(lockMap map[string]*keyLock, key string, lock *keyLock) {
+	c.locksMu.Lock()
+	defer c.locksMu.Unlock()
+	lock.refs--
+	if lock.refs == 0 && lockMap[key] == lock {
+		delete(lockMap, key)
+	}
 }
 
 func (c *CSIDriver) goServe(started chan<- bool) {

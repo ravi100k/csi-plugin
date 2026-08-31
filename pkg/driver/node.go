@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"unsafe"
@@ -347,6 +348,9 @@ func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, common.NoCapabilitiesSupplied, volume_id)
 	}
+	if readOnly && fsType == "nfs" && !slices.Contains(mountFlags, "ro") {
+		mountFlags = append(mountFlags, "ro")
+	}
 
 	// For NFS
 	if fsType == "nfs" && backingShareName == "" {
@@ -520,34 +524,47 @@ func (d *CSIDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCap
 }
 
 func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, common.EmptyVolumeId)
+	}
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
 	}
+	if req.GetCapacityRange() == nil {
+		return nil, status.Error(codes.InvalidArgument, "capacity range must be provided")
+	}
 
-	var requestedSize int64
-	if req.GetCapacityRange().GetLimitBytes() != 0 {
+	requestedSize := req.GetCapacityRange().GetRequiredBytes()
+	if requestedSize == 0 {
 		requestedSize = req.GetCapacityRange().GetLimitBytes()
-	} else {
-		requestedSize = req.GetCapacityRange().GetRequiredBytes()
+	}
+	if requestedSize <= 0 || (req.GetCapacityRange().GetLimitBytes() > 0 && requestedSize > req.GetCapacityRange().GetLimitBytes()) {
+		return nil, status.Error(codes.InvalidArgument, "invalid requested capacity range")
 	}
 
 	// Find Share
 	typeMount := false
 	fileBacked := false
 
-	volumeName := GetVolumeNameFromPath(req.GetVolumeId())
-	share, _ := d.hsclient.GetShare(ctx, volumeName)
+	fileBacked = isFileBackedVolumeID(req.GetVolumeId())
+	var share *common.ShareResponse
+	if !fileBacked {
+		volumeName := GetVolumeNameFromPath(req.GetVolumeId())
+		var err error
+		share, err = d.hsclient.GetShare(ctx, volumeName)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "resolve share-backed volume: %v", err)
+		}
+	}
 	if share != nil {
 		typeMount = true
 		if isMounted := common.IsShareMounted(share.ExportPath); !isMounted {
 			return nil, status.Error(codes.FailedPrecondition, common.ShareNotMounted)
 		}
-	} else {
-		fileBacked = true
 	}
 
 	//  Check if the specified backing share or file exists
-	if share == nil {
+	if fileBacked {
 		backingFileExists, err := d.hsclient.DoesFileExist(ctx, req.GetVolumeId())
 		if err != nil {
 			log.Error(err)
@@ -568,7 +585,8 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 	if fileBacked {
 		// Ensure it's file-backed, otherwise no-op
 		// Resize device
-		err := common.ExpandDeviceFileSize(common.ShareStagingDir+req.GetVolumeId(), requestedSize)
+		backingPath := common.ShareStagingDir + req.GetVolumeId()
+		err := common.ExpandDeviceFileSize(backingPath, requestedSize)
 		if err != nil {
 			return nil, err
 		}
@@ -576,10 +594,26 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 			if req.GetVolumePath() == "" {
 				return nil, status.Error(codes.InvalidArgument, common.EmptyVolumePath)
 			}
-			err = common.ExpandFilesystem(req.GetVolumePath(), req.VolumeCapability.GetMount().FsType)
+			fsType := req.VolumeCapability.GetMount().FsType
+			if fsType == "xfs" {
+				err = common.ExpandFilesystem(req.GetVolumePath(), fsType)
+			} else {
+				loopDevice, loopErr := loopDeviceForBackingFile(backingPath)
+				if loopErr != nil {
+					return nil, status.Errorf(codes.Internal, "resolve loop device for expansion: %v", loopErr)
+				}
+				err = common.ExpandFilesystem(loopDevice, fsType)
+			}
 			if err != nil {
 				return nil, err
 			}
+		}
+		info, statErr := os.Stat(backingPath)
+		if statErr != nil {
+			return nil, status.Errorf(codes.Internal, "verify expanded backing file: %v", statErr)
+		}
+		if info.Size() < requestedSize {
+			return nil, status.Errorf(codes.Internal, "expanded backing file is %d bytes, requested %d", info.Size(), requestedSize)
 		}
 		log.WithFields(log.Fields{
 			"volume_id":      req.GetVolumeId(),

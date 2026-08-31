@@ -1,0 +1,41 @@
+namespace: kube-system
+
+image:
+  repository: hammerspaceinc/csi-plugin
+  tag: v1.4.0
+  digest: ""
+  pullPolicy: IfNotPresent
+
+sidecars:
+  pullPolicy: IfNotPresent
+
+controller:
+  replicas: 2
+  leaderElection: true
+
+tls:
+  verify: true
+  caBundleSecretName: ""
+  caBundleKey: ca.crt
+
+credentials:
+  existingSecret: com.hammerspace.csi.credentials
+
+observability:
+  metricsEnabled: true
+  tracesExporter: none
+  serviceMonitor:
+    enabled: false
+
+storageClass:
+  create: false
+  name: hammerspace
+  parameters: {}
+
+snapshotClass:
+  create: false
+  name: hammerspace
+
+imagePullSecrets: []
+nodeSelector: {}
+tolerations: []

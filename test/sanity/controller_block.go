@@ -20,7 +20,7 @@ import (
 	"context"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/csi-test/pkg/sanity"
+	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 
 	. "github.com/onsi/gomega"
 )
@@ -34,7 +34,7 @@ const (
 	MaxNameLength int = 128
 )
 
-func TestVolumeSize(sc *sanity.SanityContext) int64 {
+func TestVolumeSize(sc *sanity.TestContext) int64 {
 	if sc.Config.TestVolumeSize > 0 {
 		return sc.Config.TestVolumeSize
 	}

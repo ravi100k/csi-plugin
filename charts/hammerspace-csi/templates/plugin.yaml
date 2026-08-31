@@ -10,8 +10,8 @@
 #                                               set to "none" to disable in prod,
 #                                               or "otlp" (+ OTEL_EXPORTER_OTLP_ENDPOINT)
 #                                               to ship to a collector.
-# Sidecars are the Kubernetes 1.36-tested set. This driver does not implement
-# ControllerPublish, so attachRequired=false and no csi-attacher is deployed.
+# Sidecar image tags (csi-provisioner / csi-attacher / csi-snapshotter /
+# csi-resizer / node-driver-registrar) match the 1.29 manifest.
 #### CSI Object
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
@@ -31,7 +31,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hammerspace-csi-frozen-targets
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 data: {}
 
 ---
@@ -39,7 +39,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hammerspace-csi-snapshot-state
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 data: {}
 
 #### Controller Service
@@ -49,12 +49,16 @@ kind: Service
 apiVersion: v1
 metadata:
   name: csi-provisioner
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
   labels:
     app: csi-provisioner
 spec:
   type: ClusterIP
   clusterIP: None
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
   # This is needed for the StatefulSet to work properly
   # as it uses a headless service to manage the pods.
   # The StatefulSet will create a DNS entry for the pods
@@ -71,13 +75,13 @@ kind: StatefulSet
 apiVersion: apps/v1
 metadata:
   name: csi-provisioner
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 spec:
   selector:
     matchLabels:
       app: csi-provisioner
   serviceName: "csi-provisioner"
-  replicas: 2
+  replicas: {{ .Values.controller.replicas }}
   template:
     metadata:
       labels:
@@ -96,7 +100,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: csi-provisioner
-          imagePullPolicy: Always
+          imagePullPolicy: {{ .Values.sidecars.pullPolicy }}
           image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.1@sha256:d992c36d4ddd6dfa37c81b487e5a673920e1360e2977eb779051df8da1c5787d
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
@@ -110,7 +114,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/
         - name: csi-snapshotter
-          imagePullPolicy: Always
+          imagePullPolicy: {{ .Values.sidecars.pullPolicy }}
           image: registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0@sha256:da081c27e8a6d91f36042c1942362d0515ced8d06e18c11b8f893e58c4d6d797
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
@@ -123,7 +127,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/
         - name: csi-resizer
-          imagePullPolicy: Always
+          imagePullPolicy: {{ .Values.sidecars.pullPolicy }}
           image: registry.k8s.io/sig-storage/csi-resizer:v2.1.0@sha256:589e525cddef6d768e68da1f0bc9ffd0a24bf3add3dd010648eb7189976fde79
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
@@ -141,8 +145,8 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          imagePullPolicy: Always
-          image: hammerspaceinc/csi-plugin:v1.4.0
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "hammerspace-csi.image" . | quote }}
           ports:
             - containerPort: 9090
               name: metrics
@@ -156,26 +160,28 @@ spec:
             - name: HS_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: username
             - name: HS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: password
             - name: HS_ENDPOINT
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: endpoint
             - name: HS_TLS_VERIFY
-              value: "true"
+              value: {{ .Values.tls.verify | quote }}
+            {{- if .Values.tls.caBundleSecretName }}
+            - name: HS_CA_BUNDLE
+              value: /etc/hammerspace/tls/{{ .Values.tls.caBundleKey }}
+            {{- end }}
             - name: CSI_MAJOR_VERSION
               value: "1"
             - name: CSI_LEADER_ELECTION
-              value: "true"
-            - name: CSI_MAX_FREEZE_DURATION
-              value: "2m"
+              value: {{ .Values.controller.leaderElection | quote }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -203,6 +209,11 @@ spec:
             - name: staging-dir
               mountPath: /var/lib/hammerspace/csi-staging
               mountPropagation: Bidirectional
+            {{- if .Values.tls.caBundleSecretName }}
+            - name: hammerspace-ca
+              mountPath: /etc/hammerspace/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: socket-dir
           emptyDir: {}
@@ -210,12 +221,17 @@ spec:
           hostPath:
             path: /var/lib/hammerspace/csi-staging
             type: DirectoryOrCreate
+        {{- if .Values.tls.caBundleSecretName }}
+        - name: hammerspace-ca
+          secret:
+            secretName: {{ .Values.tls.caBundleSecretName }}
+        {{- end }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: csi-provisioner
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 spec:
   minAvailable: 1
   selector:
@@ -226,7 +242,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: csi-provisioner
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -278,7 +294,7 @@ rules:
   # See deploy/kubernetes/SECRETS.md.
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["com.hammerspace.csi.credentials"]
+    resourceNames: [{{ .Values.credentials.existingSecret | quote }}]
     verbs: ["get"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotclasses"]
@@ -303,11 +319,11 @@ kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: csi-provisioner
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 subjects:
   - kind: ServiceAccount
     name: csi-provisioner
-    namespace: kube-system
+    namespace: {{ .Values.namespace }}
 roleRef:
   kind: ClusterRole
   name: csi-provisioner
@@ -318,7 +334,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: csi-node
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 spec:
   selector:
     matchLabels:
@@ -333,7 +349,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: driver-registrar
-          imagePullPolicy: Always
+          imagePullPolicy: {{ .Values.sidecars.pullPolicy }}
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.16.0@sha256:ab482308a4921e28a6df09a16ab99a457e9af9641ff44fb1be1a690d07ce8b70
           lifecycle:
             preStop:
@@ -366,8 +382,8 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          imagePullPolicy: Always
-          image: hammerspaceinc/csi-plugin:v1.4.0
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ include "hammerspace-csi.image" . | quote }}
           ports:
             - containerPort: 9091
               name: metrics
@@ -382,24 +398,28 @@ spec:
             - name: HS_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: username
             - name: HS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: password
             - name: HS_ENDPOINT
               valueFrom:
                 secretKeyRef:
-                  name: com.hammerspace.csi.credentials
+                  name: {{ .Values.credentials.existingSecret }}
                   key: endpoint
             - name: CSI_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: HS_TLS_VERIFY
-              value: "true"
+              value: {{ .Values.tls.verify | quote }}
+            {{- if .Values.tls.caBundleSecretName }}
+            - name: HS_CA_BUNDLE
+              value: /etc/hammerspace/tls/{{ .Values.tls.caBundleKey }}
+            {{- end }}
             - name: CSI_MAJOR_VERSION
               value: "1"
             # Log verbosity: panic, fatal, error, warn, info, debug, trace.
@@ -433,6 +453,11 @@ spec:
             - name: staging-dir
               mountPath: /var/lib/hammerspace/csi-staging
               mountPropagation: Bidirectional
+            {{- if .Values.tls.caBundleSecretName }}
+            - name: hammerspace-ca
+              mountPath: /etc/hammerspace/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: socket-dir
           hostPath:
@@ -454,18 +479,23 @@ spec:
           hostPath:
             path: /var/lib/hammerspace/csi-staging
             type: DirectoryOrCreate
+        {{- if .Values.tls.caBundleSecretName }}
+        - name: hammerspace-ca
+          secret:
+            secretName: {{ .Values.tls.caBundleSecretName }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: csi-node
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: csi-node
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -475,7 +505,7 @@ rules:
   # credential Secret (get, not cluster-wide list). See deploy/kubernetes/SECRETS.md.
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["com.hammerspace.csi.credentials"]
+    resourceNames: [{{ .Values.credentials.existingSecret | quote }}]
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["nodes"]
@@ -495,11 +525,11 @@ kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: csi-node
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 subjects:
   - kind: ServiceAccount
     name: csi-node
-    namespace: kube-system
+    namespace: {{ .Values.namespace }}
 roleRef:
   kind: ClusterRole
   name: csi-node
@@ -519,11 +549,11 @@ kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: csi-provisioner-snapshot-content-status-binding
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 subjects:
   - kind: ServiceAccount
     name: csi-provisioner
-    namespace: kube-system
+    namespace: {{ .Values.namespace }}
 roleRef:
   kind: ClusterRole
   name: csi-provisioner-snapshot-content-status
@@ -533,9 +563,29 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: csi-env-config
-  namespace: kube-system
+  namespace: {{ .Values.namespace }}
 # Example: "300ms". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 data:
   MOUNT_CHECK_TIMEOUT: "30s"
   UNMOUNT_RETRY_COUNT: "5"
   UNMOUNT_RETRY_INTERVAL: "1s"
+{{- if .Values.observability.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: hammerspace-csi-controller
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: csi-provisioner
+spec:
+  selector:
+    matchLabels:
+      app: csi-provisioner
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.namespace }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+{{- end }}

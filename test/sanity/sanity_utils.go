@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/hammer-space/csi-plugin/pkg/client"
-	"github.com/kubernetes-csi/csi-test/pkg/sanity"
+	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"gopkg.in/yaml.v2"
 )
 

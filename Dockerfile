@@ -1,28 +1,19 @@
 # Copyright 2019 Hammerspace
 
 # ---------- Stage 1: Builder ----------
-FROM rockylinux/rockylinux:9-ubi AS builder
-
-# Install build tools
-RUN dnf -y update && \
-    dnf -y install python3-pip git golang make && \
-    dnf clean all
-
-# Install hstk (Python 3 version)
-RUN python3 -m pip install --no-cache-dir --user hstk
-ENV PATH=$PATH:/root/.local/bin
+FROM golang:1.26.0-bookworm@sha256:2a0ba12e116687098780d3ce700f9ce3cb340783779646aafbabed748fa6677c AS builder
 
 # Set working directory
 WORKDIR /go/src/github.com/hammer-space/csi-plugin/
 
 # Add source code
-ADD . ./
+COPY . ./
 
 # Build plugin
 RUN make compile
 
 # ---------- Stage 2: Runtime ----------
-FROM rockylinux/rockylinux:9-ubi
+FROM rockylinux/rockylinux:9-ubi@sha256:01d66807e8ec11cf13002b6c0f9300cd09a28e7f1e135950bbac0492e940ea96
 
 # Enable `devel` repo to access libverto-libevent
 RUN dnf --nodocs --nobest -y install \

@@ -203,8 +203,8 @@ func validateEnvironmentVars() {
 	}
 
 	csiMajorVersion := os.Getenv("CSI_MAJOR_VERSION")
-	if csiMajorVersion != "0" && csiMajorVersion != "1" {
-		log.Error("CSI_MAJOR_VERSION must be set to \"0\" or \"1\"")
+	if csiMajorVersion != "1" {
+		log.Error("CSI_MAJOR_VERSION must be set to \"1\"; CSI 0.x is no longer supported")
 		os.Exit(1)
 	}
 
@@ -286,7 +286,6 @@ func main() {
 
 	var server Server
 
-	CSI_version := os.Getenv("CSI_MAJOR_VERSION")
 	endpoint := os.Getenv("CSI_ENDPOINT")
 
 	csiDriver := driver.NewCSIDriver(
@@ -305,12 +304,7 @@ func main() {
 		}
 	}
 
-	if CSI_version == "0" {
-		server = driver.NewCSIDriver_v0Support(csiDriver)
-		common.CsiVersion = "0"
-	} else {
-		server = csiDriver
-	}
+	server = csiDriver
 
 	// Listen
 	os.Remove(endpoint)

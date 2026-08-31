@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, v1.4.0]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Static analysis
+        run: go vet ./...
+      - name: Unit tests
+        run: go test -skip '^TestSanity' -count=1 ./...
+      - name: Compile csi-test v5 suites
+        run: make sanity-compile
+      - name: Race tests
+        run: go test -race ./pkg/...
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/hammerspace-csi
+      - run: helm template hammerspace charts/hammerspace-csi --namespace kube-system > rendered.yaml
+
+  image:
+    runs-on: ubuntu-latest
+    needs: [test, helm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: hammerspace-csi:ci
+          no-cache: true
+          pull: true
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: hammerspace-csi:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: anchore/sbom-action@v0
+        with:
+          image: hammerspace-csi:ci
+          format: spdx-json
+          output-file: hammerspace-csi.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: hammerspace-csi.spdx.json

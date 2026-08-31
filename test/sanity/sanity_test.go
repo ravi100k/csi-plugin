@@ -24,7 +24,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	sanity "github.com/kubernetes-csi/csi-test/pkg/sanity"
+	sanity "github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 )
 
 var (
@@ -61,7 +61,7 @@ func TestSanity(t *testing.T) {
 	}()
 
 	// Run test
-	config := &sanity.Config{
+	config := &sanity.TestConfig{
 		CreateTargetDir:          Mkdir, //Work around for sanity trying to recreate existing directories and failing
 		CreateStagingDir:         Mkdir,
 		CreatePathCmdTimeout:     30,
@@ -71,5 +71,5 @@ func TestSanity(t *testing.T) {
 		TestVolumeParametersFile: os.Getenv("SANITY_PARAMS_FILE"),
 		TestVolumeSize:           1 * 1024 * 1024 * 1024,
 	}
-	sanity.Test(t, config)
+	sanity.Test(t, *config)
 }

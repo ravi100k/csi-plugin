@@ -254,3 +254,35 @@ func (p *LockProbe) Acquired() func() {
 		locksHeld.Add(p.ctx, -1, p.opt())
 	}
 }
+
+var (
+	freezeMetricsOnce sync.Once
+	frozenTargets     metric.Int64UpDownCounter
+	freezeRecoveries  metric.Int64Counter
+	freezeDuration    metric.Float64Histogram
+)
+
+func initFreezeMetrics() {
+	m := otel.Meter("github.com/hammer-space/csi-plugin")
+	frozenTargets, _ = m.Int64UpDownCounter("hs_csi_frozen_targets",
+		metric.WithDescription("Number of workload filesystem targets currently frozen"))
+	freezeRecoveries, _ = m.Int64Counter("hs_csi_freeze_recovery_attempts_total",
+		metric.WithDescription("Persistent frozen-target recovery attempts"))
+	freezeDuration, _ = m.Float64Histogram("hs_csi_freeze_duration_seconds",
+		metric.WithDescription("How long a workload target remained frozen"), metric.WithUnit("s"))
+}
+
+func RecordFrozenTarget(ctx context.Context, delta int64) {
+	freezeMetricsOnce.Do(initFreezeMetrics)
+	frozenTargets.Add(ctx, delta)
+}
+
+func RecordFreezeRecovery(ctx context.Context, success bool) {
+	freezeMetricsOnce.Do(initFreezeMetrics)
+	freezeRecoveries.Add(ctx, 1, metric.WithAttributes(attribute.Bool("success", success)))
+}
+
+func RecordFreezeDuration(ctx context.Context, duration time.Duration) {
+	freezeMetricsOnce.Do(initFreezeMetrics)
+	freezeDuration.Record(ctx, duration.Seconds())
+}

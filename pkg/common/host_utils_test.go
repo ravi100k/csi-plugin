@@ -1,13 +1,101 @@
 package common
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestCreateFormattedRawFileAtomically(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	finalPath := filepath.Join(t.TempDir(), "volume.img")
+	partialPath := finalPath + ".hscsi-partial"
+	var calls []string
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		calls = append(calls, command)
+		if command == "qemu-img" {
+			if err := os.WriteFile(args[2], []byte("raw"), 0600); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+
+	if err := CreateFormattedRawFileAtomically(context.Background(), finalPath, 4096, "ext4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		t.Fatalf("completed volume was not published: %v", err)
+	}
+	if _, err := os.Stat(partialPath); !os.IsNotExist(err) {
+		t.Fatalf("partial file remains after success: %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"qemu-img", "mkfs.ext4"}) {
+		t.Fatalf("creation order = %v, want qemu-img then mkfs.ext4", calls)
+	}
+}
+
+func TestCreateFormattedRawFileAtomicallyCleansFailedFormat(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	finalPath := filepath.Join(t.TempDir(), "volume.img")
+	partialPath := finalPath + ".hscsi-partial"
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		if command == "qemu-img" {
+			return nil, os.WriteFile(args[2], []byte("raw"), 0600)
+		}
+		return nil, fmt.Errorf("injected mkfs failure")
+	}
+
+	if err := CreateFormattedRawFileAtomically(context.Background(), finalPath, 4096, "ext4"); err == nil {
+		t.Fatal("expected formatting failure")
+	}
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("incomplete volume became visible: %v", err)
+	}
+	if _, err := os.Stat(partialPath); !os.IsNotExist(err) {
+		t.Fatalf("partial file was not cleaned: %v", err)
+	}
+}
+
+func TestCloneDirectoryAtomically(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+	ExecCommand = execCommandHelper
+
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	destination := filepath.Join(root, "destination")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data"), []byte("clone-data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CloneDirectoryAtomically(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "clone-data" {
+		t.Fatalf("cloned data = %q", got)
+	}
+	if _, err := os.Stat(destination + ".hscsi-partial"); !os.IsNotExist(err) {
+		t.Fatalf("partial clone remains: %v", err)
+	}
+}
 
 func TestGetNFSExports(t *testing.T) {
 	// case 1: empty output → should return error
