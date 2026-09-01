@@ -1,6 +1,6 @@
 module github.com/hammer-space/csi-plugin
 
-go 1.26.0
+go 1.27.0
 
 require (
 	github.com/container-storage-interface/spec v1.13.0 // - Apache 2.0 license
