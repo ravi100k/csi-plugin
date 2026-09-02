@@ -6,7 +6,7 @@ FROM golang:1.27.0-bookworm AS builder
 # Set working directory
 WORKDIR /go/src/github.com/hammer-space/csi-plugin/
 
-# Add source code
+# Copy source code
 COPY . ./
 
 # Build plugin

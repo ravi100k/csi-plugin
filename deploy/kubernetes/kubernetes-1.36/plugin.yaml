@@ -97,7 +97,7 @@ spec:
       containers:
         - name: csi-provisioner
           imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.1@sha256:d992c36d4ddd6dfa37c81b487e5a673920e1360e2977eb779051df8da1c5787d
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.1.1
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--timeout=60s"  # Recommended as shares may take some time to create
@@ -111,7 +111,7 @@ spec:
               mountPath: /var/lib/csi/
         - name: csi-snapshotter
           imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0@sha256:da081c27e8a6d91f36042c1942362d0515ced8d06e18c11b8f893e58c4d6d797
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--leader-election=true"
@@ -124,7 +124,7 @@ spec:
               mountPath: /var/lib/csi/
         - name: csi-resizer
           imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-resizer:v2.1.0@sha256:589e525cddef6d768e68da1f0bc9ffd0a24bf3add3dd010648eb7189976fde79
+          image: registry.k8s.io/sig-storage/csi-resizer:v2.1.0
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--leader-election=true"
@@ -334,7 +334,7 @@ spec:
       containers:
         - name: driver-registrar
           imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.16.0@sha256:ab482308a4921e28a6df09a16ab99a457e9af9641ff44fb1be1a690d07ce8b70
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.16.0
           lifecycle:
             preStop:
               exec:
