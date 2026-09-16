@@ -218,6 +218,26 @@ func ExpandFilesystem(device, fsType string) error {
 	return nil
 }
 
+// GetFilesystemType identifies the filesystem from the loop device's on-disk
+// signature. This avoids maintaining a filesystem-magic allowlist and works
+// even when a replacement CSI node container cannot see kubelet's existing
+// mount in its own mount namespace. An empty result means a raw block volume.
+func GetFilesystemType(backingFile string) (string, error) {
+	loopDevice, err := determineLoopDeviceFromBackingFile(backingFile)
+	if err != nil {
+		return "", err
+	}
+	output, err := ExecCommand("blkid", "-p", "-s", "TYPE", "-o", "value", loopDevice)
+	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 2 {
+			return "", nil // blkid: no recognizable filesystem signature
+		}
+		return "", fmt.Errorf("could not determine filesystem type on %q: %w", loopDevice, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func BindMountDevice(sourcefile, destfile string) error {
 	mounter := mount.New("")
 	// Check if the file already exists

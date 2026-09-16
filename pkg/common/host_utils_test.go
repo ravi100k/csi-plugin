@@ -224,3 +224,29 @@ func TestExpandDeviceFileSizeOrdering(t *testing.T) {
 		t.Errorf("losetup -c target = %q, want %s", got, loopdev)
 	}
 }
+
+func TestGetFilesystemTypeUsesDeviceSignature(t *testing.T) {
+	original := ExecCommand
+	defer func() { ExecCommand = original }()
+
+	const backing = "/mnt/backing/volume.img"
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		switch command {
+		case "losetup":
+			return []byte("/dev/loop7: [2049]:999 (" + backing + ")\n"), nil
+		case "blkid":
+			return []byte("btrfs\n"), nil
+		default:
+			t.Fatalf("unexpected command %q", command)
+			return nil, nil
+		}
+	}
+
+	fsType, err := GetFilesystemType(backing)
+	if err != nil {
+		t.Fatalf("GetFilesystemType returned error: %v", err)
+	}
+	if fsType != "btrfs" {
+		t.Fatalf("filesystem type = %q, want btrfs", fsType)
+	}
+}

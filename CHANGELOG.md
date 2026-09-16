@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AnvilRoute` collapses `share-snapshots` share/snapshot identifiers to `{id}`, preventing unbounded `hs_csi_anvil_requests_total` metric cardinality.
 - Survive a stale/dead backing-share NFS mount (timeout-bounded mount + force-unmount before remount) instead of leaking the lock and wedging serialized provisioning. See `docs/node-unmount-recovery.md`.
 - Route file-backed snapshot deletes to the file-snapshot API instead of always calling the share-snapshot delete.
-- `NodeExpandVolume` now grows file-backed filesystems using the request's actual mount point (`req.GetVolumePath()`) instead of reconstructing the backing-file path. `xfs_growfs` requires a mount point argument and has no fallback for a backing file, so xfs file-backed expansion previously failed on every attempt. (#72)
+- `NodeExpandVolume` now grows file-backed filesystems using the request's actual mount point (`req.GetVolumePath()`) instead of reconstructing the backing-file path. When the optional CSI `volume_capability` is absent, the driver discovers the filesystem type from that mount point instead of silently treating the volume as raw block. `xfs_growfs` requires a mounted filesystem argument, so either behavior previously left online XFS expansion incomplete and the PVC in `FileSystemResizePending`. (#72)
 - Guarded the `CreateSnapshot` dedup cache (`recentlyCreatedSnapshots`) with its own mutex, independent of the per-snapshot-name lock. The per-name lock only serializes calls for the same snapshot name; concurrent `CreateSnapshot` calls for different names could read/write the shared map at the same instant, which is a fatal, crash-the-process condition in Go. (#73)
 
 ### Security

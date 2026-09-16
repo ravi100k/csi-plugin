@@ -41,6 +41,7 @@ var (
 	statVolumePath     = os.Stat
 	lstatTargetPath    = os.Lstat
 	forceUnmountTarget = common.ForceUnmountFilesystem
+	filesystemType     = common.GetFilesystemType
 )
 
 func (d *CSIDriver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -509,13 +510,11 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 	}
 
 	// Find Share
-	typeMount := false
 	fileBacked := false
 
 	volumeName := GetVolumeNameFromPath(req.GetVolumeId())
 	share, _ := d.hsclient.GetShare(ctx, volumeName)
 	if share != nil {
-		typeMount = true
 		if isMounted := common.IsShareMounted(share.ExportPath); !isMounted {
 			return nil, status.Error(codes.FailedPrecondition, common.ShareNotMounted)
 		}
@@ -535,25 +534,20 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 			fileBacked = true
 		}
 	}
-	switch req.GetVolumeCapability().GetAccessType().(type) {
-	case *csi.VolumeCapability_Block:
-		typeMount = false
-	case *csi.VolumeCapability_Mount:
-		typeMount = true
-	}
-
 	if fileBacked {
 		// Ensure it's file-backed, otherwise no-op
 		// Resize device
-		err := common.ExpandDeviceFileSize(common.ShareStagingDir+req.GetVolumeId(), requestedSize)
+		backingFile := common.ShareStagingDir + req.GetVolumeId()
+		err := common.ExpandDeviceFileSize(backingFile, requestedSize)
 		if err != nil {
 			return nil, err
 		}
-		if typeMount {
-			if req.GetVolumePath() == "" {
-				return nil, status.Error(codes.InvalidArgument, common.EmptyVolumePath)
-			}
-			err = common.ExpandFilesystem(req.GetVolumePath(), req.VolumeCapability.GetMount().FsType)
+		fsType, err := nodeExpansionFilesystemType(req, backingFile)
+		if err != nil {
+			return nil, err
+		}
+		if fsType != "" {
+			err = common.ExpandFilesystem(req.GetVolumePath(), fsType)
 			if err != nil {
 				return nil, err
 			}
@@ -568,4 +562,32 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 	} else {
 		return nil, nil
 	}
+}
+
+// nodeExpansionFilesystemType determines whether NodeExpandVolume must grow a
+// filesystem and, if so, which one. volume_capability is optional in the CSI
+// specification, so kubelet may provide only volume_path. In that case inspect
+// the path and loop device rather than silently treating the request as a raw
+// block expansion.
+func nodeExpansionFilesystemType(req *csi.NodeExpandVolumeRequest, backingFile string) (string, error) {
+	if mountCapability := req.GetVolumeCapability().GetMount(); mountCapability != nil {
+		if req.GetVolumePath() == "" {
+			return "", status.Error(codes.InvalidArgument, common.EmptyVolumePath)
+		}
+		if mountCapability.GetFsType() != "" {
+			return mountCapability.GetFsType(), nil
+		}
+	}
+	if _, isBlock := req.GetVolumeCapability().GetAccessType().(*csi.VolumeCapability_Block); isBlock {
+		return "", nil
+	}
+	if req.GetVolumePath() == "" {
+		return "", status.Error(codes.InvalidArgument, common.EmptyVolumePath)
+	}
+
+	fsType, err := filesystemType(backingFile)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "could not determine filesystem type at %q: %v", req.GetVolumePath(), err)
+	}
+	return fsType, nil
 }
