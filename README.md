@@ -164,20 +164,96 @@ Currently, only the ``topology.csi.hammerspace.com/is-data-portal`` key is suppo
 
 ## Development
 ### Requirements
-* Docker
-* Golang 1.12+
-* nfs-utils
+* Docker (a current Docker Engine is recommended for UBI 9)
+* Go 1.25+ for building the binary outside a container
+* NFS tools on the host for local mount tests
 
 ### Building
-##### Build a new docker image from local source:
-```sudo make build```
 
-##### Build a new release:
-Update VERSION file, then
+Every team member can build the driver without a Red Hat account, activation
+key, or prebuilt Hammerspace base image:
 
 ```bash
+make build
+make test-image
+# Build only the Go binary, without Docker or subscription access:
+make compile
+# Tag the container with VERSION:
 make build-release
 ```
+
+The Dockerfile uses a public UBI Go toolset to compile the driver and a UBI 9
+runtime. Public UBI repositories provide common packages, but do not provide
+all of `nfs-utils`, `e2fsprogs`, `xfsprogs`, and `qemu-img`. The missing tools and
+their dependencies come from signed public Rocky Linux 9 RPM repositories.
+`ubi/RPM-GPG-KEY-Rocky-9` is a **public verification key**, safe to commit and
+share; it is not a subscription credential. Its fingerprint is
+`21CB 256A E16F C54C 6E65 2949 702D 426D 350D 275D`, published on
+[Rocky's key information page](https://rockylinux.org/resources/gpg-key-info).
+
+The installer updates from UBI first, prefers UBI for new dependencies, and
+excludes every installed package from the Rocky repositories. It fails if a
+UBI package is replaced or a previously intact non-configuration RPM file is
+modified. Dependencies that cannot be satisfied under these constraints fail
+the build. The Rocky repositories remain disabled afterward. The image retains
+RPM metadata and licenses, plus `/usr/share/hs-csi-plugin/runtime-packages.txt`
+with package versions and vendors.
+
+`make test-image` checks helper startup, raw file creation/growth, ext4/XFS
+formatting, and offline ext4 growth in a disposable container. NFS mounts,
+loop devices, filesystem freezing, and online XFS growth still require cluster
+tests. The driver runs as root because it performs those privileged operations.
+
+#### Certification and package provenance
+
+This is a UBI-based certification candidate, not a claim of certification.
+A certified public precedent is
+[TrueNAS CSI in the Red Hat catalog](https://catalog.redhat.com/en/software/containers/truenas_solutions/truenas-csi/6985755d3b7beb38c0e642fc):
+its [v1.1.1 Dockerfile](https://github.com/truenas/truenas-csi/blob/v1.1.1/Dockerfile.ubi)
+obtains storage tools from public CentOS Stream repositories and copies them
+into UBI. Here RPM installation preserves dependency and provenance information
+instead of copying individual binaries and libraries. Hammerspace maintains
+the added community packages; they are not Red Hat-supplied RPMs.
+
+Other vendors take different approaches:
+[NetApp's Dockerfile](https://github.com/NetApp/trident/blob/master/Dockerfile)
+uses entitlement secrets for its RHEL dependency build;
+[Dell documents rebuilding on a released driver image](https://infohub.delltechnologies.com/en-us/p/how-to-build-a-custom-dell-csi-driver-3/).
+The selected public-repository approach lets every contributor rebuild from
+source without distributing subscription credentials.
+
+Before release, run preflight, vulnerability scanning, and the CSI certification
+suite and submit this exact image for Red Hat review. Follow the
+[OpenShift image requirements](https://docs.redhat.com/en/documentation/red_hat_software_certification/2026/html/red_hat_openshift_software_certification_policy_guide/assembly-requirements-for-container-images_openshift-sw-cert-policy-introduction).
+Pin the approved image digest in release manifests and rebuild regularly for
+updates; a successful local build or another vendor's certification does not
+certify this image.
+
+If your certification agreement requires all runtime OS packages to come from
+Red Hat, keep entitlement in a maintainer's build environment. The optional
+`make runtime-base-rhel` uses `hack/build_runtime_base.sh` with a file outside
+the repository containing `RH_ORG_ID` and `RH_ACTIVATION_KEY`:
+
+```bash
+make runtime-base-rhel RH_SUB_SECRET=/path/outside/repo/build-subscription.env
+# Maintainer publishes the resulting :ubi9-9.6-rhel base under the applicable
+# Red Hat redistribution terms. Teammates then use its registry digest:
+DOCKER_BUILDKIT=1 make build RUNTIME_BASE=your-registry/runtime@sha256:...
+```
+
+Only that alternative base build needs entitlement. It mounts the credential
+file into a disposable container and unregisters before committing the image.
+The normal Dockerfile never reads it. On an entitled RHEL host, Red Hat's
+Podman can also inherit the host entitlement for package installation.
+
+#### Deployment manifest source
+
+Edit `deploy/kubernetes/kubernetes-1.36/plugin.yaml` for shared driver workloads
+and RBAC, then run `make -C operator generate`. The operator's `operands.json`
+is generated, not maintained separately. Operator builds regenerate it and
+operator tests reject stale generated content. Operator-specific adjustments
+are kept in the generator; see [operator development](operator/README.md).
+Older Kubernetes manifests remain versioned independently.
 
 ##### Publish a new release
 ```bash

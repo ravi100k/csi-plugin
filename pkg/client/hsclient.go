@@ -1251,17 +1251,18 @@ func (client *HammerspaceClient) GetClusterAvailableCapacity(ctx context.Context
 	}
 
 	var cluster common.ClusterResponse
-	err = json.Unmarshal([]byte(respBody), &cluster)
-	if err != nil {
+	if err = json.Unmarshal([]byte(respBody), &cluster); err != nil {
 		log.Error("Error parsing JSON response: " + err.Error())
+		return 0, err
 	}
-	// set free capacity to cache expire in 5 min
-	common.SetCacheData("FREE_CAPACITY", cluster.Capacity["free"], 60*5)
 
-	free := cluster.Capacity["free"]
-	if err != nil {
-		log.Error("Error parsing free cluster capacity: " + err.Error())
+	free, ok := cluster.Capacity["free"]
+	if !ok {
+		return 0, fmt.Errorf("cluster state reported no free capacity")
 	}
+
+	// set free capacity to cache expire in 5 min
+	common.SetCacheData("FREE_CAPACITY", free, 60*5)
 
 	return free, nil
 }

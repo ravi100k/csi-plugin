@@ -1300,19 +1300,12 @@ func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 
 	var blockRequested bool
 	var filesystemRequested bool
-	fileBacked := false
-	var fsType string
 	for _, cap := range req.VolumeCapabilities {
 		switch cap.AccessType.(type) {
 		case *csi.VolumeCapability_Block:
 			blockRequested = true
-			fileBacked = true
 		case *csi.VolumeCapability_Mount:
 			filesystemRequested = true
-			fsType = cap.GetMount().FsType
-			if fsType != "nfs" {
-				fileBacked = true
-			}
 		}
 	}
 
@@ -1327,23 +1320,30 @@ func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 		return nil, err
 	}
 
-	var available int64 = 0
-	//  Check if the specified backing share or file exists
-	if fileBacked {
-		var backingShareName string
-		if blockRequested {
-			backingShareName = vParams.BlockBackingShareName
-		} else {
-			backingShareName = vParams.MountBackingShareName
-		}
+	// The volume type comes from the StorageClass parameters, not from
+	// req.VolumeCapabilities. A capacity query carries no fsType, so deciding
+	// on the capability alone treated every class as file-backed and looked up
+	// an empty backing share name for the nfs and raw block classes.
+	backingShareName := vParams.BlockBackingShareName
+	if backingShareName == "" && vParams.FSType != "" && vParams.FSType != "nfs" {
+		backingShareName = vParams.MountBackingShareName
+	}
+
+	var available int64
+	if backingShareName != "" {
 		backingShare, err := d.hsclient.GetShare(ctx, backingShareName)
 		if err != nil {
-			available = 0
+			return nil, status.Errorf(codes.Internal, "backing share %s: %v", backingShareName, err)
 		}
 		if backingShare != nil {
 			available = backingShare.Space.Available
+		} else {
+			// Not created yet; it will be carved from cluster capacity.
+			available, err = d.hsclient.GetClusterAvailableCapacity(ctx)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
 		}
-
 	} else {
 		// Return all capacity of cluster for share backed volumes
 		available, err = d.hsclient.GetClusterAvailableCapacity(ctx)

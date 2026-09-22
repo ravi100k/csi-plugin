@@ -10,8 +10,8 @@
 #                                               set to "none" to disable in prod,
 #                                               or "otlp" (+ OTEL_EXPORTER_OTLP_ENDPOINT)
 #                                               to ship to a collector.
-# Sidecar image tags (csi-provisioner / csi-attacher / csi-snapshotter /
-# csi-resizer / node-driver-registrar) match the 1.29 manifest.
+# Most sidecar image tags match the 1.29 manifest. The resizer is newer to
+# populate PVC expansion recovery status on Kubernetes 1.32 and later.
 #### CSI Object
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
@@ -22,6 +22,12 @@ spec:
   requiresRepublish: true
   volumeLifecycleModes:
     - Persistent
+  # Requires --enable-capacity on the provisioner below, plus the
+  # csistoragecapacities/csinodes/statefulsets grants in its ClusterRole.
+  # Enabling this without a publisher, or with a driver that reports 0, makes
+  # the scheduler reject every node with "did not have enough free storage".
+  # GetCapacity reports per StorageClass from the class parameters; it does
+  # not vary by topology segment, so every segment sees the cluster figure.
   storageCapacity: true
 
 #### Controller Service
@@ -76,9 +82,22 @@ spec:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--timeout=60s"  # Recommended as shares may take some time to create
             - "--v=5"
+            # Publishes the CSIStorageCapacity objects that back the
+            # CSIDriver's storageCapacity: true. ownerref-level=1 resolves
+            # this pod's StatefulSet as owner so they are garbage collected.
+            - "--enable-capacity"
+            - "--capacity-ownerref-level=1"
           env:
             - name: CSI_ENDPOINT
               value: /var/lib/csi/hs-csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/
@@ -108,10 +127,22 @@ spec:
               mountPath: /var/lib/csi/
         - name: csi-resizer
           imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-resizer:v1.10.1
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.14.0
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--v=5"
+          env:
+            - name: CSI_ENDPOINT
+              value: /var/lib/csi/hs-csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/
+        - name: liveness-probe
+          imagePullPolicy: Always
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.12.0
+          args:
+            - "--csi-address=$(CSI_ENDPOINT)"
+            - "--health-port=9808"
           env:
             - name: CSI_ENDPOINT
               value: /var/lib/csi/hs-csi.sock
@@ -131,6 +162,20 @@ spec:
               name: metrics
               hostPort: 9090
               protocol: TCP
+            - containerPort: 9808
+              name: healthz
+              hostPort: 9808
+              protocol: TCP
+          # Served by the liveness-probe sidecar above (shares this pod's
+          # network via hostNetwork), which polls this container's CSI
+          # Probe RPC and restarts this container via kubelet on failure.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 60
           envFrom:
             - configMapRef:
                 name: csi-env-config
@@ -180,7 +225,8 @@ spec:
           emptyDir: {}
         - name: staging-dir
           hostPath:
-            path: /tmp
+            path: /var/lib/hammerspace/staging
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -251,6 +297,19 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch", "update"]
+  # Capacity publication (--enable-capacity on the provisioner). csinodes
+  # enumerate the topology segments capacity is reported per; the statefulsets
+  # grant resolves the owner reference so the objects are garbage collected
+  # with the controller.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
@@ -285,18 +344,6 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-        - name: csi-resizer
-          imagePullPolicy: Always
-          image: registry.k8s.io/sig-storage/csi-resizer:v1.10.1
-          args:
-            - "--csi-address=$(CSI_ENDPOINT)"
-            - "--v=5"
-          env:
-            - name: CSI_ENDPOINT
-              value: /csi/csi.sock
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /csi
         - name: driver-registrar
           imagePullPolicy: Always
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0
@@ -325,6 +372,18 @@ spec:
               mountPath: /csi
             - name: registration-dir
               mountPath: /registration
+        - name: liveness-probe
+          imagePullPolicy: Always
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.12.0
+          args:
+            - "--csi-address=$(CSI_ENDPOINT)"
+            - "--health-port=9809"
+          env:
+            - name: CSI_ENDPOINT
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
         - name: hs-csi-plugin-node
           securityContext:
             privileged: true
@@ -338,6 +397,20 @@ spec:
               name: metrics
               hostPort: 9091
               protocol: TCP
+            - containerPort: 9809
+              name: healthz
+              hostPort: 9809
+              protocol: TCP
+          # Served by the liveness-probe sidecar above (shares this pod's
+          # network via hostNetwork), which polls this container's CSI
+          # Probe RPC and restarts this container via kubelet on failure.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 60
           envFrom:
             - configMapRef:
                 name: csi-env-config
@@ -417,7 +490,8 @@ spec:
             path: /dev
         - name: staging-dir
           hostPath:
-            path: /tmp
+            path: /var/lib/hammerspace/staging
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: ServiceAccount
