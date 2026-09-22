@@ -24,8 +24,9 @@ file-backed volumes. It is not yet a certified or cluster-tested release.
 The first release fixes the namespace to `hammerspace-csi`. StorageClass
 definitions are immutable after CR creation. Generated classes use
 WaitForFirstConsumer, Retain and expansion enabled. Classes are not defaults.
-Capacity publication stays disabled in CSIDriver because the provisioner is not
-configured to publish CSIStorageCapacity objects.
+Capacity publication is enabled in CSIDriver and the provisioner. It uses the
+driver's GetCapacity implementation; use the matching driver build so old
+capacity-reporting behavior does not leave claims unschedulable.
 
 ## Storage modes
 
@@ -78,7 +79,9 @@ The single source for CSI workloads and RBAC is
 Edit that manifest, then run `make -C operator generate` from the repository
 root. Commit the resulting `internal/operator/operands.json` together with the
 manifest; the JSON is generated build input, not a second configuration to
-maintain. `make build` regenerates it, while `make test` rejects stale output.
+maintain. The same command derives `config/development-images.json` and the
+manager's `RELATED_IMAGE_*` defaults from that manifest, so image updates cannot
+silently differ between manual, Operator and development bundle installs. `make build` regenerates it, while `make test` rejects stale output.
 The image build regenerates it inside Docker from the same source manifest:
 run `make image` here, or `docker build -f operator/Dockerfile .` from the root.
 
@@ -101,10 +104,15 @@ still required before considering this implementation validated.
 
 Use a separate test cluster or a planned migration of the manual driver. Make
 the built Operator image available to the cluster and change its image in
-`config/manager.yaml`. Set the six RELATED_IMAGE values to the intended driver
-and sidecar images. `config/development-images.json` and the manager manifest use
-existing deployment tags as development defaults; these are not certification
-claims and do not contain unbuilt local driver fixes.
+`config/manager.yaml`. First build the matching driver with `make build-release`
+from the repository root and make that tagged image available to the test
+cluster. The default driver tag follows the current manual manifest and must
+include this branch's capacity and snapshot fixes; using an older driver with
+capacity publication enabled can prevent scheduling. To select a different
+registry/tag, edit the canonical manifest and run `make generate`. Its seven
+operand images propagate to the manager and development bundle inventory.
+These development defaults are not certification claims. For release bundles,
+use a separate digest-pinned image inventory via `--images`.
 
 ```sh
 oc create namespace hammerspace-csi
@@ -157,7 +165,7 @@ This creates ignored `bundle/` containing the CSV, CRD, annotations, bundle
 Dockerfile and `catalog.json`. It supports OwnNamespace installation in
 `hammerspace-csi` only. The namespace must permit the privileged operands;
 create/label it as shown in `config/manager.yaml` before OLM installation.
-The CSV lists all seven images, including the Operator, under relatedImages.
+The CSV lists all eight images, including the Operator, under relatedImages.
 Use `--images` with a release image JSON file, `--release`, and an explicit
 `--openshift-versions` range to require digest pins. That switch validates inputs;
 it does not certify them. The generated catalog starts an alpha channel and has
@@ -175,11 +183,6 @@ NFS, raw-block, ext4 and xfs certification capability manifests based on measure
 support. Do not turn the existing NFS-only manifest into a block test profile.
 Run raw-block write/read, pod/node restart, expansion, snapshot/restore and
 reclaim tests; validate multi-node behavior and Virtualization separately.
-
-Existing driver failures involving mount options, file subPath and larger NFS
-restores remain open. The imported-snapshot fixes are local until built into a
-driver image. See the [implementation plan](../deploy/openshift/operator-plan.md)
-and [certification record](../openshift-certification-results.md).
 
 Red Hat requires certification/publication of the Operator and referenced
 containers before CSI certification, and driver installation through the

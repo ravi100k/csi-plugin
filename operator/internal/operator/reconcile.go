@@ -44,11 +44,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return err
 	}
 	spec, err := ParseSpec(cr)
-	if err != nil {
-		return r.condition(ctx, cr, false, false, "InvalidConfiguration", err.Error())
-	}
+	// An invalid mutable setting must not strand the cleanup finalizer. ParseSpec
+	// returns the decoded spec even when semantic validation fails; cleanup only
+	// needs its immutable StorageClass inventory and checks every object's owner.
 	if cr.GetDeletionTimestamp() != nil {
 		return r.cleanup(ctx, cr, spec)
+	}
+	if err != nil {
+		return r.condition(ctx, cr, false, false, "InvalidConfiguration", err.Error())
 	}
 	ns := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 	if _, err := r.Client.Resource(ns).Get(ctx, Namespace, metav1.GetOptions{}); err != nil {

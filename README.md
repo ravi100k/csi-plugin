@@ -180,6 +180,8 @@ make test-image
 make compile
 # Tag the container with VERSION:
 make build-release
+# Refresh base images and OS/Python dependencies for a release rebuild:
+make build-release BUILD_FLAGS='--pull --no-cache'
 ```
 
 The Dockerfile uses a public UBI Go toolset to compile the driver and a UBI 9
@@ -250,7 +252,8 @@ Podman can also inherit the host entitlement for package installation.
 
 Edit `deploy/kubernetes/kubernetes-1.36/plugin.yaml` for shared driver workloads
 and RBAC, then run `make -C operator generate`. The operator's `operands.json`
-is generated, not maintained separately. Operator builds regenerate it and
+is generated, not maintained separately. The development image inventory and
+manager image defaults are generated from the same manifest. Operator builds regenerate them and
 operator tests reject stale generated content. Operator-specific adjustments
 are kept in the generator; see [operator development](operator/README.md).
 Older Kubernetes manifests remain versioned independently.

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
+	"regexp"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -13,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -160,6 +164,68 @@ func TestRenderStorageModesAndBlockHostAccess(t *testing.T) {
 	}
 }
 
+func TestRenderPreservesAnnotationsAndAllowsMissingContainerEnv(t *testing.T) {
+	previous := operands
+	t.Cleanup(func() { operands = previous })
+	var templates []map[string]interface{}
+	if err := json.Unmarshal(operands, &templates); err != nil {
+		t.Fatal(err)
+	}
+	for _, template := range templates {
+		if template["kind"] != "StatefulSet" {
+			continue
+		}
+		unstructured.SetNestedStringMap(template, map[string]string{"prometheus.io/scrape": "true"}, "spec", "template", "metadata", "annotations")
+		containers, _, _ := unstructured.NestedSlice(template, "spec", "template", "spec", "containers")
+		delete(containers[0].(map[string]interface{}), "env")
+		unstructured.SetNestedSlice(template, containers, "spec", "template", "spec", "containers")
+	}
+	var err error
+	operands, err = json.Marshal(templates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := find(t, mustRender(t, testCR()), "StatefulSet", "csi-provisioner")
+	annotations, _, _ := unstructured.NestedStringMap(controller.Object, "spec", "template", "metadata", "annotations")
+	if annotations["prometheus.io/scrape"] != "true" || annotations["storage.hammerspace.com/credentials-version"] != "secret-uid/1" {
+		t.Fatalf("template annotations were lost: %v", annotations)
+	}
+	containers, _, _ := unstructured.NestedSlice(controller.Object, "spec", "template", "spec", "containers")
+	if env, _, _ := unstructured.NestedSlice(containers[0].(map[string]interface{}), "env"); len(env) != 0 {
+		t.Fatalf("unexpected sidecar environment: %v", env)
+	}
+}
+
+func TestRenderRejectsUnknownContainer(t *testing.T) {
+	previous := operands
+	t.Cleanup(func() { operands = previous })
+	var templates []map[string]interface{}
+	if err := json.Unmarshal(operands, &templates); err != nil {
+		t.Fatal(err)
+	}
+	for _, template := range templates {
+		if template["kind"] != "StatefulSet" {
+			continue
+		}
+		containers, _, _ := unstructured.NestedSlice(template, "spec", "template", "spec", "containers")
+		containers[0].(map[string]interface{})["name"] = "unknown-sidecar"
+		unstructured.SetNestedSlice(template, containers, "spec", "template", "spec", "containers")
+	}
+	var err error
+	operands, err = json.Marshal(templates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr := testCR()
+	spec, err := ParseSpec(cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(cr, spec, testImages(), "secret-uid/1"); err == nil {
+		t.Fatal("unknown container must fail before deploying an empty image reference")
+	}
+}
+
 func TestSpecRejectsInvalidConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -186,6 +252,36 @@ func TestSpecRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestCRDNamesMatchKubernetesValidation(t *testing.T) {
+	data, err := os.ReadFile("../../config/crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = yaml.ToJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]interface{}
+	if err := json.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _, _ := unstructured.NestedSlice(crd, "spec", "versions")
+	properties, _, _ := unstructured.NestedMap(versions[0].(map[string]interface{}), "schema", "openAPIV3Schema", "properties", "spec", "properties")
+	for _, path := range [][]string{{"credentialsSecretName", "pattern"}, {"storageClasses", "items", "properties", "name", "pattern"}} {
+		pattern, found, err := unstructured.NestedString(properties, path...)
+		if err != nil || !found {
+			t.Fatalf("missing schema pattern at %v: %v", path, err)
+		}
+		re := regexp.MustCompile(pattern)
+		for _, name := range []string{"credentials", "credentials.example.com", "a", "a-b.c-d", "a..b", "a.-b", "a-.b", "-a", "A"} {
+			want := len(validation.IsDNS1123Subdomain(name)) == 0
+			if got := re.MatchString(name); got != want {
+				t.Errorf("schema %v accepts %q = %v, Kubernetes validation = %v", path, name, got, want)
+			}
+		}
 	}
 }
 
@@ -357,6 +453,46 @@ func TestMissingCredentialsAndCleanupPreserveUserData(t *testing.T) {
 	node := find(t, mustRender(t, testCR()), "DaemonSet", "csi-node")
 	if _, err := r.resource(node).Get(ctx, node.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatal("node not removed")
+	}
+}
+
+func TestCleanupAfterConfigurationBecomesInvalid(t *testing.T) {
+	r, client := harness(t)
+	ctx := context.Background()
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cr, err := client.Resource(DriverResource).Get(ctx, "cluster", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Older CRD versions admitted this name. Uninstall must work even when a
+	// stored resource no longer passes the current runtime validation.
+	unstructured.SetNestedField(cr.Object, "a..b", "spec", "credentialsSecretName")
+	if _, err := ParseSpec(cr); err == nil {
+		t.Fatal("regression fixture must fail semantic validation")
+	}
+	now := metav1.Now()
+	cr.SetDeletionTimestamp(&now)
+	if _, err := client.Resource(DriverResource).Update(ctx, cr, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := r.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cr, err = client.Resource(DriverResource).Get(ctx, "cluster", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFinalizer(cr) {
+		t.Fatal("invalid configuration stranded the cleanup finalizer")
+	}
+	for _, operand := range mustRender(t, testCR()) {
+		if _, err := r.resource(operand).Get(ctx, operand.GetName(), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Errorf("owned %s %s remains after cleanup: %v", operand.GetKind(), operand.GetName(), err)
+		}
 	}
 }
 

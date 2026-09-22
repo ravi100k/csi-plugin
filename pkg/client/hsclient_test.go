@@ -554,3 +554,39 @@ func TestCloneShareSnapshotRequiresTaskLocation(t *testing.T) {
 		t.Fatalf("expected missing task location error, got %v", err)
 	}
 }
+
+func TestClusterCapacityRejectsMalformedOrMissingCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name, response string
+		want           int64
+		wantError      bool
+	}{
+		{"free space", `{"capacity":{"free":8192}}`, 8192, false},
+		{"full cluster", `{"capacity":{"free":0}}`, 0, false},
+		{"missing capacity", `{}`, 0, true},
+		{"missing free", `{"capacity":{"used":20}}`, 0, true},
+		{"invalid JSON", `{`, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupHTTP()
+			defer tearDownHTTP()
+			Mux.HandleFunc(BasePath+"/cntl/state", func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, tc.response)
+			})
+			// Failed responses must not overwrite the last valid cache value.
+			common.SetCacheData("FREE_CAPACITY", int64(123), 300)
+			capacity, err := hsclient.GetClusterAvailableCapacity(context.Background())
+			if (err != nil) != tc.wantError || capacity != tc.want {
+				t.Fatalf("capacity = %d, error = %v; want %d, error=%v", capacity, err, tc.want, tc.wantError)
+			}
+			cached, err := common.GetCacheData("FREE_CAPACITY")
+			wantCache := tc.want
+			if tc.wantError {
+				wantCache = 123
+			}
+			if err != nil || cached != wantCache {
+				t.Fatalf("cache = %v, %v; want %d", cached, err, wantCache)
+			}
+		})
+	}
+}

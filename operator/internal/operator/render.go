@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hammer-space/csi-plugin/operator/internal/manifests"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -128,18 +130,16 @@ func Render(cr *unstructured.Unstructured, spec Spec, images Images, secretVersi
 			for _, c := range containers {
 				container := c.(map[string]interface{})
 				name := container["name"].(string)
-				key := strings.TrimPrefix(name, "csi-")
-				if name == "driver-registrar" {
-					key = "registrar"
-				}
-				if name == "liveness-probe" {
-					key = "livenessprobe"
-				}
-				if strings.HasPrefix(name, "hs-csi-plugin-") {
-					key = "driver"
+				key, ok := manifests.ContainerImageKey(name)
+				if !ok || images[key] == "" {
+					return nil, fmt.Errorf("no release image for container %q", name)
 				}
 				container["image"] = images[key]
-				for _, e := range container["env"].([]interface{}) {
+				envVars, _, err := unstructured.NestedSlice(container, "env")
+				if err != nil {
+					return nil, err
+				}
+				for _, e := range envVars {
 					env := e.(map[string]interface{})
 					if ref, ok := env["valueFrom"].(map[string]interface{}); ok {
 						if secret, ok := ref["secretKeyRef"].(map[string]interface{}); ok {
@@ -153,6 +153,7 @@ func Render(cr *unstructured.Unstructured, spec Spec, images Images, secretVersi
 						env["value"] = spec.LogLevel
 					}
 				}
+				unstructured.SetNestedSlice(container, envVars, "env")
 			}
 			selector := map[string]interface{}{"kubernetes.io/os": "linux"}
 			for k, val := range spec.NodeSelector {
@@ -166,7 +167,15 @@ func Render(cr *unstructured.Unstructured, spec Spec, images Images, secretVersi
 				pod["tolerations"] = tolerations
 			}
 			unstructured.SetNestedMap(v, pod, "spec", "template", "spec")
-			unstructured.SetNestedStringMap(v, map[string]string{"storage.hammerspace.com/credentials-version": secretVersion}, "spec", "template", "metadata", "annotations")
+			annotations, _, err := unstructured.NestedStringMap(v, "spec", "template", "metadata", "annotations")
+			if err != nil {
+				return nil, err
+			}
+			if annotations == nil {
+				annotations = map[string]string{}
+			}
+			annotations["storage.hammerspace.com/credentials-version"] = secretVersion
+			unstructured.SetNestedStringMap(v, annotations, "spec", "template", "metadata", "annotations")
 		}
 		result = append(result, o)
 	}

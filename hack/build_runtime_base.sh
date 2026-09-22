@@ -37,7 +37,7 @@ docker run -d --name "$CONTAINER_NAME" \
 docker exec "$CONTAINER_NAME" bash -c '
   set -a; . /run/secrets/rhsub; set +a
   trap "subscription-manager unregister || true; subscription-manager clean || true; \
-        rm -rf /etc/pki/entitlement /etc/pki/consumer/*.pem /etc/rhsm/ca/*.pem /var/lib/rhsm/*" EXIT
+        rm -rf /etc/pki/entitlement /etc/pki/consumer/*.pem /var/lib/rhsm/*" EXIT
   set -e
   subscription-manager register --org="$RH_ORG_ID" --activationkey="$RH_ACTIVATION_KEY"
   dnf --nodocs --nobest -y install \

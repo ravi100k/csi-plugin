@@ -13,6 +13,7 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.6
 ARG VERSION=0.1.0
 ARG RELEASE=1
 LABEL name="hammerspace-csi-operator" \
+      maintainer="Hammerspace" \
       vendor="Hammerspace" \
       version="${VERSION}" \
       release="${RELEASE}" \

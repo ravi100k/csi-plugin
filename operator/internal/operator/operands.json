@@ -272,7 +272,7 @@
                   }
                 }
               ],
-              "image": "hammerspaceinc/csi-plugin:v1.3.0",
+              "image": "hammerspaceinc/csi-plugin:v1.4.0",
               "imagePullPolicy": "IfNotPresent",
               "livenessProbe": {
                 "httpGet": {
@@ -792,7 +792,7 @@
                   }
                 }
               ],
-              "image": "hammerspaceinc/csi-plugin:v1.3.0",
+              "image": "hammerspaceinc/csi-plugin:v1.4.0",
               "imagePullPolicy": "IfNotPresent",
               "livenessProbe": {
                 "httpGet": {

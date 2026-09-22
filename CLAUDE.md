@@ -98,7 +98,9 @@ a 15s reconcile loop).
 
 - `internal/manifests/generate.go` derives `internal/operator/operands.json` from
   `../deploy/kubernetes/kubernetes-1.36/plugin.yaml`; run `make generate` after
-  editing the canonical manifest. Builds regenerate it; tests check for drift.
+  editing the canonical manifest. The same command updates development image
+  defaults and manager image environment values. Builds regenerate them; tests
+  check for drift.
 - `internal/operator/render.go` — pure function: CR spec + image set →desired
   Kubernetes objects (StatefulSet, DaemonSet, RBAC, CSIDriver, SCC,
   StorageClasses, etc.) as `unstructured.Unstructured`.

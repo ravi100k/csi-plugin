@@ -20,7 +20,7 @@ def generate(args):
         raise ValueError("version must be a semantic version")
     images = json.loads(args.images.read_text())
     if set(images) != KEYS or not all(isinstance(v, str) and v for v in images.values()):
-        raise ValueError("images must contain exactly the six nonempty operand image references")
+        raise ValueError(f"images must contain exactly {len(KEYS)} nonempty operand image references")
     if args.release:
         if not args.openshift_versions:
             raise ValueError("release requires an explicitly validated OpenShift version range")
