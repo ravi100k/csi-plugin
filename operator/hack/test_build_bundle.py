@@ -1,4 +1,5 @@
 import argparse
+from datetime import date
 import json
 from pathlib import Path
 import tempfile
@@ -34,7 +35,9 @@ class BundleTests(unittest.TestCase):
         self.args = argparse.Namespace(
             version="0.1.0", operator_image="example.invalid/operator:dev",
             bundle_image="example.invalid/bundle:dev", images=ROOT / "config/development-images.json",
-            output=Path(self.temp.name) / "bundle", release=False, openshift_versions=None)
+            output=Path(self.temp.name) / "bundle", release=False, openshift_versions=None,
+            created_at=date.today().isoformat(), support="Hammerspace",
+            valid_subscription="A valid Hammerspace software subscription is required.")
 
     def test_inventory_matches_deployed_images_and_permissions(self):
         generate(self.args)
@@ -52,10 +55,23 @@ class BundleTests(unittest.TestCase):
             expected = next(obj["rules"] for obj in original if obj["kind"] == kind)
             self.assertEqual(csv["spec"]["install"]["spec"][field][0]["rules"], expected)
         self.assertEqual([m["type"] for m in csv["spec"]["installModes"] if m["supported"]], ["OwnNamespace"])
+        self.assertEqual(csv["spec"]["minKubeVersion"], "1.29.0")
         catalog = [json.loads(line) for line in (self.args.output / "catalog.json").read_text().splitlines()]
         self.assertEqual(catalog[2]["name"], csv["metadata"]["name"])
         self.assertEqual(catalog[2]["image"], self.args.bundle_image)
         self.assertEqual(catalog[2]["relatedImages"], csv["spec"]["relatedImages"])
+        annotations = csv["metadata"]["annotations"]
+        for key in ["categories", "description", "containerImage", "createdAt", "support",
+                    "operators.openshift.io/valid-subscription",
+                    "features.operators.openshift.io/disconnected",
+                    "features.operators.openshift.io/fips-compliant",
+                    "features.operators.openshift.io/proxy-aware",
+                    "features.operators.openshift.io/tls-profiles",
+                    "features.operators.openshift.io/token-auth-aws",
+                    "features.operators.openshift.io/token-auth-azure",
+                    "features.operators.openshift.io/token-auth-gcp",
+                    "features.operators.openshift.io/csi"]:
+            self.assertIn(key, annotations)
 
     def test_release_requires_digests_and_explicit_range(self):
         self.args.release = True
@@ -71,6 +87,20 @@ class BundleTests(unittest.TestCase):
         generate(self.args)
         csv = yaml.safe_load((self.args.output / "manifests/hammerspace-csi-operator.clusterserviceversion.yaml").read_text())
         self.assertEqual(csv["metadata"]["annotations"]["com.redhat.openshift.versions"], "v4.22")
+        self.assertEqual(csv["metadata"]["annotations"]["features.operators.openshift.io/disconnected"], "true")
+
+    def test_release_accepts_digest_pinned_upstream_sidecars(self):
+        self.args.release = True
+        self.args.openshift_versions = "v4.22"
+        pinned = {k: "registry.k8s.io/sig-storage/{}@sha256:{}".format(k, "a" * 64) for k in KEYS}
+        self.args.images = Path(self.temp.name) / "images.json"
+        self.args.images.write_text(json.dumps(pinned))
+        self.args.operator_image = "example.invalid/operator@sha256:" + "b" * 64
+        generate(self.args)
+        csv = yaml.safe_load((self.args.output / "manifests/hammerspace-csi-operator.clusterserviceversion.yaml").read_text())
+        related = {item["name"]: item["image"] for item in csv["spec"]["relatedImages"]}
+        for name in KEYS:
+            self.assertEqual(related[name], pinned[name])
 
     def test_rejects_incomplete_image_inventory(self):
         self.args.images = Path(self.temp.name) / "images.json"

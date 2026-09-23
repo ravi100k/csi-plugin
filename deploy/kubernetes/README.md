@@ -261,6 +261,13 @@ The driver snapshots native share-backed volumes with a share snapshot and
 file-backed volumes with a file snapshot (freezing the source filesystem
 briefly for a crash-consistent image); there is nothing to configure.
 
+> **Known limitation:** A native share-backed NFS snapshot cannot be restored
+> into a new PVC. Hammerspace keeps the snapshot inside its source share and can
+> restore it only within that same share; each NFS PVC is a separate share.
+> `CreateVolume` therefore rejects that restore request rather than returning a
+> PVC backed by the wrong share. Snapshot creation, listing, and deletion remain
+> supported for backup and recovery workflows that operate on the source share.
+
 > **Known limitation:** Snapshot and restore are not supported for NFS volumes
 > provisioned as directories with `mountBackingShareName`. The backend does not
 > currently provide a recursive directory snapshot/clone operation. Snapshotting
@@ -271,7 +278,8 @@ briefly for a crash-consistent image); there is nothing to configure.
 
 Reference the snapshot as a PVC `dataSource`. This provisions a **new**,
 independent volume — see [`example_snapshot.yaml`](./example_snapshot.yaml) for
-the snapshot and restore together.
+the snapshot and restore together. This is supported for file-backed filesystem
+and block volumes, not native share-backed NFS volumes.
 
 ```yaml
 apiVersion: v1

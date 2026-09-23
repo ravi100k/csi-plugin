@@ -167,8 +167,13 @@ Dockerfile and `catalog.json`. It supports OwnNamespace installation in
 create/label it as shown in `config/manager.yaml` before OLM installation.
 The CSV lists all eight images, including the Operator, under relatedImages.
 Use `--images` with a release image JSON file, `--release`, and an explicit
-`--openshift-versions` range to require digest pins. That switch validates inputs;
-it does not certify them. The generated catalog starts an alpha channel and has
+`--openshift-versions` range to require digest pins. Every sidecar must be listed
+in `spec.relatedImages` and included in certification review. Digest-pinned
+upstream sidecars are allowed as generator inputs; Red Hat payload sidecars can
+be selected instead when appropriate for the target release. See
+[`config/certified-images.example.json`](config/certified-images.example.json)
+and [`../docs/redhat-certification.md`](../docs/redhat-certification.md).
+That switch validates inputs; it does not certify them. The generated catalog starts an alpha channel and has
 no upgrade edge until an upgrade path is tested.
 
 Run Operator SDK bundle validation, `opm validate`, container certification

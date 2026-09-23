@@ -27,9 +27,6 @@ Run a single test: `go test ./pkg/driver/... -run TestName -v`
 
 Normal Docker builds require no Red Hat subscription: UBI 9 plus signed Rocky 9
 packages for missing storage tools, with installed UBI packages protected.
-`make runtime-base-rhel` is an optional maintainer-only alternative using
-`RH_SUB_SECRET`; see README for package provenance and certification limits.
-
 Operator module (`operator/`, separate `go.mod`, pins its own client-go — run
 commands from inside `operator/`):
 ```bash

@@ -178,10 +178,10 @@ make build
 make test-image
 # Build only the Go binary, without Docker or subscription access:
 make compile
-# Tag the container with VERSION:
-make build-release
-# Refresh base images and OS/Python dependencies for a release rebuild:
-make build-release BUILD_FLAGS='--pull --no-cache'
+# Build and tag the UBI-based certification candidate with VERSION:
+make build-release RELEASE=1
+# Rebuild the certification candidate without cached application layers:
+make build-release RELEASE=1 BUILD_FLAGS='--no-cache'
 ```
 
 The Dockerfile uses a public UBI Go toolset to compile the driver and a UBI 9
@@ -208,7 +208,12 @@ tests. The driver runs as root because it performs those privileged operations.
 
 #### Certification and package provenance
 
-This is a UBI-based certification candidate, not a claim of certification.
+`make build-release` uses the reproducible public UBI-based runtime and runs
+`hack/verify_certification_image.sh` after the build. The verifier reports the
+signed Rocky storage-tool RPMs so their provenance is explicit during Red Hat
+review; it does not treat them as an automatic certification failure.
+
+This is a certification candidate, not a claim of certification.
 A certified public precedent is
 [TrueNAS CSI in the Red Hat catalog](https://catalog.redhat.com/en/software/containers/truenas_solutions/truenas-csi/6985755d3b7beb38c0e642fc):
 its [v1.1.1 Dockerfile](https://github.com/truenas/truenas-csi/blob/v1.1.1/Dockerfile.ubi)
@@ -224,29 +229,13 @@ uses entitlement secrets for its RHEL dependency build;
 The selected public-repository approach lets every contributor rebuild from
 source without distributing subscription credentials.
 
-Before release, run preflight, vulnerability scanning, and the CSI certification
+Before release, follow [`docs/redhat-certification.md`](docs/redhat-certification.md),
+run preflight, vulnerability scanning, and the CSI certification
 suite and submit this exact image for Red Hat review. Follow the
 [OpenShift image requirements](https://docs.redhat.com/en/documentation/red_hat_software_certification/2026/html/red_hat_openshift_software_certification_policy_guide/assembly-requirements-for-container-images_openshift-sw-cert-policy-introduction).
 Pin the approved image digest in release manifests and rebuild regularly for
 updates; a successful local build or another vendor's certification does not
 certify this image.
-
-If your certification agreement requires all runtime OS packages to come from
-Red Hat, keep entitlement in a maintainer's build environment. The optional
-`make runtime-base-rhel` uses `hack/build_runtime_base.sh` with a file outside
-the repository containing `RH_ORG_ID` and `RH_ACTIVATION_KEY`:
-
-```bash
-make runtime-base-rhel RH_SUB_SECRET=/path/outside/repo/build-subscription.env
-# Maintainer publishes the resulting :ubi9-9.6-rhel base under the applicable
-# Red Hat redistribution terms. Teammates then use its registry digest:
-DOCKER_BUILDKIT=1 make build RUNTIME_BASE=your-registry/runtime@sha256:...
-```
-
-Only that alternative base build needs entitlement. It mounts the credential
-file into a disposable container and unregisters before committing the image.
-The normal Dockerfile never reads it. On an entitled RHEL host, Red Hat's
-Podman can also inherit the host entitlement for package installation.
 
 #### Deployment manifest source
 

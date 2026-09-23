@@ -5,6 +5,7 @@ Requires PyYAML. This creates local files only; it never publishes images.
 """
 import argparse
 import copy
+from datetime import date
 import json
 from pathlib import Path
 import re
@@ -41,7 +42,19 @@ def generate(args):
     annotations = {
         "capabilities": "Basic Install",
         "categories": "Storage",
+        "description": "Deploys and manages the Hammerspace Container Storage Interface driver.",
         "containerImage": args.operator_image,
+        "createdAt": args.created_at,
+        "support": args.support,
+        "operators.openshift.io/valid-subscription": args.valid_subscription,
+        "features.operators.openshift.io/disconnected": "true" if args.release else "false",
+        "features.operators.openshift.io/fips-compliant": "false",
+        "features.operators.openshift.io/proxy-aware": "false",
+        "features.operators.openshift.io/tls-profiles": "false",
+        "features.operators.openshift.io/token-auth-aws": "false",
+        "features.operators.openshift.io/token-auth-azure": "false",
+        "features.operators.openshift.io/token-auth-gcp": "false",
+        "features.operators.openshift.io/csi": "true",
         "operatorframework.io/suggested-namespace": "hammerspace-csi",
         "alm-examples": json.dumps([example]),
     }
@@ -54,6 +67,7 @@ def generate(args):
             "displayName": "Hammerspace CSI Operator",
             "description": "Manages Hammerspace CSI workloads for NFS, raw block, and ext4/xfs file-backed volumes. Install in hammerspace-csi. Requires an existing credentials Secret and Linux nodes with NFS and loop-device support. Development packaging; certification is a separate release gate.",
             "version": args.version, "maturity": "alpha", "provider": {"name": "Hammerspace"},
+            "minKubeVersion": "1.29.0",
             "installModes": [{"type": mode, "supported": mode == "OwnNamespace"} for mode in ["OwnNamespace", "SingleNamespace", "MultiNamespace", "AllNamespaces"]],
             "customresourcedefinitions": {"owned": [{"name": "hammerspacecsidrivers.storage.hammerspace.com", "version": "v1alpha1", "kind": "HammerspaceCSIDriver", "displayName": "Hammerspace CSI Driver", "description": "Singleton configuration for the Hammerspace CSI installation"}]},
             "install": {"strategy": "deployment", "spec": {
@@ -99,6 +113,12 @@ def main():
     parser.add_argument("--images", type=Path, default=ROOT / "config/development-images.json")
     parser.add_argument("--output", type=Path, default=ROOT / "bundle")
     parser.add_argument("--openshift-versions")
+    parser.add_argument("--created-at", default=date.today().isoformat())
+    parser.add_argument("--support", default="Hammerspace")
+    parser.add_argument(
+        "--valid-subscription",
+        default="A valid Hammerspace software subscription is required.",
+    )
     parser.add_argument("--release", action="store_true", help="require digest pins and explicit OpenShift range; does not imply certification")
     args = parser.parse_args()
     try:

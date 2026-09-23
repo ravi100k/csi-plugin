@@ -87,6 +87,10 @@ spec:
             # this pod's StatefulSet as owner so they are garbage collected.
             - "--enable-capacity"
             - "--capacity-ownerref-level=1"
+            # The OpenShift CSI capacity test waits 60 seconds for a newly
+            # created StorageClass. Keep publication comfortably inside that
+            # window instead of relying on the provisioner's 1 minute default.
+            - "--capacity-poll-interval=30s"
           env:
             - name: CSI_ENDPOINT
               value: /var/lib/csi/hs-csi.sock

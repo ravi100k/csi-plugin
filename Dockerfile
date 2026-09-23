@@ -12,9 +12,9 @@ RUN go mod download
 COPY main.go ./
 COPY pkg ./pkg
 ARG version=dev
-ARG release=unknown
+ARG githash=unknown
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-    -ldflags "-X github.com/hammer-space/csi-plugin/pkg/common.Version=${version} -X github.com/hammer-space/csi-plugin/pkg/common.Githash=${release}" \
+    -ldflags "-X github.com/hammer-space/csi-plugin/pkg/common.Version=${version} -X github.com/hammer-space/csi-plugin/pkg/common.Githash=${githash}" \
     -o /tmp/hs-csi-plugin .
 
 # ---------- Stage 2: Public runtime dependencies ----------
@@ -35,13 +35,15 @@ RUN mkdir -p /licenses && ln -s /usr/share/licenses /licenses/rpm-packages
 FROM ${RUNTIME_BASE}
 ARG version=dev
 ARG release=1
+ARG githash=unknown
 LABEL name="hammerspace-csi-plugin" \
       maintainer="Hammerspace" \
       vendor="Hammerspace" \
       version="${version}" \
       release="${release}" \
       summary="Hammerspace CSI driver" \
-      description="Implements the Container Storage Interface for Hammerspace NFS and file-backed block volumes."
+      description="Implements the Container Storage Interface for Hammerspace NFS and file-backed block volumes." \
+      org.opencontainers.image.revision="${githash}"
 ENV PATH=$PATH:/root/.local/bin
 WORKDIR /hs-csi-plugin
 COPY --from=builder /tmp/hs-csi-plugin ./hs-csi-plugin
