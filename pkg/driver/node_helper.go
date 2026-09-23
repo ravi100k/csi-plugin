@@ -21,26 +21,43 @@ import (
 
 // Mount share and attach it
 func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, targetPath string, mountFlags []string, fqdn string) error {
+	// Hold the root mount lock for the whole publish. The bind below takes its
+	// source from the shared root export, so the export must not be unmounted,
+	// remounted, or have its VFS flags changed by another volume between
+	// EnsureRootExportMounted and BindMountDevice -- that is exactly the race
+	// that left published volumes stale and broke kubelet's subPath
+	// preparation with ESTALE.
+	unlock, err := d.acquireRootMountLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	// Step 0 — Ensure root share mount exists for this volume (lazy stage for old volumes)
-	// Lazy stage for old volumes (skip if root share already mounted)
 	rootShareMounted, _ := common.SafeIsMountPoint(common.BaseBackingShareMountPath)
 	if !rootShareMounted {
 		log.Infof("[LazyStage] Root share not mounted — performing stage for old volume %s", volumeId)
+	}
 
-		// Create marker file (same as NodeStageVolume)
-		if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-			log.Warnf("Failed to create marker root directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
-		}
-		marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeId)
-		if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
-			log.Warnf("Not able to create marker file path %s err %v", marker, err)
-		}
+	// Record this volume against the root mount before relying on it, so an
+	// unstage of some other volume cannot conclude the export is unused. This
+	// is idempotent with the marker NodeStageVolume already wrote.
+	if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
+		return status.Errorf(codes.Internal, "create volume marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
+	}
+	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeId)
+	if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
+		return status.Errorf(codes.Internal, "write volume marker %s: %v", marker, err)
+	}
 
-		// Mount root export (same as NodeStageVolume)
-		if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, fqdn); err != nil {
-			return status.Errorf(codes.Internal, "[LazyStage] root export mount failed: %v", err)
-		}
+	// Mount the root export (a no-op when it is already mounted) and apply THIS
+	// volume's mount flags to it, which must happen before the bind below is
+	// created from it.
+	if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, fqdn); err != nil {
+		return status.Errorf(codes.Internal, "root export mount failed: %v", err)
+	}
 
+	if !rootShareMounted {
 		// Clear old mount because now this will come up with bind mount.
 		// This meant the the publish was not from bind mount, so remove old share mount to clear old direct nfs mount and do bind mount from here.
 		log.Debugf("Strating unmouting for target path %s, due to old style mount from v1.2.7 and earlier", targetPath)
@@ -93,12 +110,28 @@ func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, targ
 		sourcePath += "/"
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// Bounded well inside the root-mount lock's own 30s acquisition timeout, so
+	// a slow submount here cannot make every other Node RPC on this node fail
+	// with Aborted while queued behind this lock.
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	if err := d.WaitForPathReady(ctx, sourcePath, 500*time.Millisecond); err != nil {
 		log.Errorf("Volume path %s not ready: %v", sourcePath, err)
 		return status.Errorf(codes.Internal, "volume path %s not ready: %v", sourcePath, err)
+	}
+
+	// Apply this volume's VFS flags to the BIND SOURCE -- this volume's own
+	// nested NFS submount -- not to the root export.
+	//
+	// EnsureRootExportMounted remounts the root, but MS_REMOUNT is not
+	// recursive and does not reach a submount that already exists underneath
+	// it. Each volume is its own submount, so the flags must be set here, on
+	// the exact mount the bind below is taken from, and only after
+	// WaitForPathReady has triggered that submount into existence.
+	if err := common.RemountBindOptions(sourcePath, mountFlags); err != nil {
+		// Not fatal: the volume is usable, just without its per-volume flags.
+		log.Warnf("could not apply mount options %v to %s: %v", mountFlags, sourcePath, err)
 	}
 
 	if err := common.BindMountDevice(sourcePath, targetPath); err != nil {
@@ -252,58 +285,93 @@ func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareNam
 		}
 	}
 
-	if mounted {
-		log.Debugf("Volume already published at %s", targetPath)
-		return nil
-	}
-
-	hsVolume := &common.HSVolume{
-		FQDN:       fqdn,
-		FSType:     fsType,
-		MountFlags: mountFlags,
-	}
-
-	log.WithFields(log.Fields{
-		"fqdn":             hsVolume.FQDN,
-		"FSType":           hsVolume.FSType,
-		"backingShareName": backingShareName,
-	}).Info("Publish file backed volume.")
-
-	// Ensure the backing share is mounted
-	if err := d.EnsureBackingShareMounted(ctx, backingShareName, hsVolume); err != nil {
-		return err
-	}
-
-	// Mount the file
-	log.Infof("Mounting file-backed volume at %s", targetPath)
 	filePath := common.ShareStagingDir + volumePath
 
-	if fsType == "" {
-		deviceStr, err := AttachLoopDeviceWithRetry(filePath, readOnly)
-		if err != nil {
-			log.Errorf("failed to attach loop device: %v", err)
-			CleanupLoopDevice(ctx, deviceStr)
-			d.UnmountBackingShareIfUnused(ctx, backingShareName)
-			return status.Errorf(codes.Internal, common.LoopDeviceAttachFailed, deviceStr, filePath)
-		}
-		log.Infof("File %s attached to %s", filePath, deviceStr)
-
-		if err := common.BindMountDevice(deviceStr, targetPath); err != nil {
-			log.Errorf("bind mount failed for %s: %v", deviceStr, err)
-			CleanupLoopDevice(ctx, deviceStr)
-			d.UnmountBackingShareIfUnused(ctx, backingShareName)
-			return err
-		}
+	if mounted {
+		log.Debugf("Volume already published at %s", targetPath)
 	} else {
-		// StorageClass mountOptions are used for the backing NFS share mount.
-		// Do not pass them to the local ext4/xfs mount of the backing file.
-		var filesystemMountFlags []string
-		if readOnly {
-			filesystemMountFlags = append(filesystemMountFlags, "ro")
+		hsVolume := &common.HSVolume{
+			FQDN:       fqdn,
+			FSType:     fsType,
+			MountFlags: mountFlags,
 		}
-		if err := common.MountFilesystem(filePath, targetPath, fsType, filesystemMountFlags); err != nil {
-			d.UnmountBackingShareIfUnused(ctx, backingShareName)
+
+		log.WithFields(log.Fields{
+			"fqdn":             hsVolume.FQDN,
+			"FSType":           hsVolume.FSType,
+			"backingShareName": backingShareName,
+		}).Info("Publish file backed volume.")
+
+		// Ensure the backing share is mounted
+		if err := d.EnsureBackingShareMounted(ctx, backingShareName, hsVolume); err != nil {
 			return err
+		}
+
+		// Mount the file
+		log.Infof("Mounting file-backed volume at %s", targetPath)
+
+		if fsType == "" {
+			deviceStr, err := AttachLoopDeviceWithRetry(filePath, readOnly)
+			if err != nil {
+				log.Errorf("failed to attach loop device: %v", err)
+				CleanupLoopDevice(ctx, deviceStr)
+				d.UnmountBackingShareIfUnused(ctx, backingShareName)
+				return status.Errorf(codes.Internal, common.LoopDeviceAttachFailed, deviceStr, filePath)
+			}
+			log.Infof("File %s attached to %s", filePath, deviceStr)
+
+			if err := common.BindMountDevice(deviceStr, targetPath); err != nil {
+				log.Errorf("bind mount failed for %s: %v", deviceStr, err)
+				CleanupLoopDevice(ctx, deviceStr)
+				d.UnmountBackingShareIfUnused(ctx, backingShareName)
+				return err
+			}
+		} else {
+			// StorageClass mountOptions are used for the backing NFS share mount.
+			// Do not pass them to the local ext4/xfs mount of the backing file.
+			var filesystemMountFlags []string
+			if readOnly {
+				filesystemMountFlags = append(filesystemMountFlags, "ro")
+			}
+			if err := common.MountFilesystem(filePath, targetPath, fsType, filesystemMountFlags); err != nil {
+				d.UnmountBackingShareIfUnused(ctx, backingShareName)
+				return err
+			}
+		}
+	}
+
+	// A volume restored from a snapshot into a larger PVC has had its raw
+	// backing file grown by the controller (growRestoredDeviceFile), but the
+	// ext4/xfs filesystem inside it is still the snapshot's original size — only
+	// a node has the loop device needed to grow it. Reconcile it here, to the
+	// backing file's CURRENT size rather than to any requested size, so an
+	// already-expanded volume can never be shrunk back.
+	//
+	// This runs on every publish, including one that found the volume already
+	// mounted, because the underlying operations are idempotent no-ops when
+	// there is nothing to grow. That also retries a reconciliation that failed
+	// on an earlier publish attempt, which would otherwise be masked forever by
+	// the "already published" path reporting success.
+	//
+	// KNOWN LIMITATION: skipped for read-only publishes, since resize2fs and
+	// xfs_growfs must write to the filesystem. A larger restored volume whose
+	// first-ever publish is read-only therefore keeps the snapshot's smaller
+	// filesystem. Fixing that would require growing the filesystem through the
+	// driver's own writable staging mount before ever publishing it read-only.
+	if fsType != "" && !readOnly {
+		if err := common.ReconcileFilesystemToBackingFile(targetPath, filePath, fsType); err != nil {
+			if !mounted {
+				// Fresh mount: this is where a restored volume gets the capacity
+				// its PVC asked for, so a failure here must surface.
+				log.Errorf("failed to reconcile filesystem size at %s: %v", targetPath, err)
+				return status.Errorf(codes.Internal, "failed to reconcile filesystem size: %v", err)
+			}
+			// Already mounted, i.e. a republish of a healthy volume
+			// (requiresRepublish drives these periodically). The reconcile is a
+			// no-op in the steady state, so a transient loop-device lookup
+			// failure here must not tear down a working volume -- warn and let
+			// the next republish retry.
+			log.Warnf("could not reconcile filesystem size at %s on republish: %v", targetPath, err)
 		}
 	}
 	return nil

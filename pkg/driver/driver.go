@@ -141,6 +141,31 @@ func (c *CSIDriver) acquireVolumeLock(ctx context.Context, volID string) (func()
 	return func() { lk.unlock(); release() }, nil
 }
 
+// acquireRootMountLock serializes the lifecycle of the node-wide root NFS
+// export at common.BaseBackingShareMountPath.
+//
+// That single mount is shared by every share-backed volume on the node, each
+// volume's data is a nested NFS submount inside it, and NodeUnstageVolume
+// unmounts it as soon as the last volume is unstaged. Without this lock, an
+// unstage could tear it down and the next stage rebuild it while another
+// volume was already published off it -- which invalidated that volume's bind
+// and made kubelet's subPath preparation fail with ESTALE, reproduced by
+// correlating two root remounts ten seconds apart against the certification
+// suite's subPath failures.
+//
+// It reuses the volume lock map, keyed by the mount path. That key cannot
+// collide with a CSI volume ID, which is always a Hammerspace share or file
+// path.
+//
+// This is deliberately exclusive rather than shared-for-readers: a publish
+// holds it for the duration of its bind, so concurrent stages and publishes on
+// a node serialize behind each other. The lock carries the same 30s timeout as
+// every other lock here, so contention surfaces to kubelet as a retryable
+// Aborted instead of a hang.
+func (c *CSIDriver) acquireRootMountLock(ctx context.Context) (func(), error) {
+	return c.acquireVolumeLock(ctx, common.BaseBackingShareMountPath)
+}
+
 func (c *CSIDriver) acquireSnapshotLock(ctx context.Context, snapID string) (func(), error) {
 	log.Debug("acquireSnapshotLock: ", snapID)
 	c.locksMu.Lock()

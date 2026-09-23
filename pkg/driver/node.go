@@ -41,6 +41,7 @@ var (
 	statVolumePath     = os.Stat
 	lstatTargetPath    = os.Lstat
 	forceUnmountTarget = common.ForceUnmountFilesystem
+	filesystemType     = common.GetFilesystemType
 )
 
 func (d *CSIDriver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -204,17 +205,29 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 		mountFlags = append(mountFlags, volumeCapability.GetMount().MountFlags...)
 	}
 
+	// The root export is a single node-wide mount shared by every share-backed
+	// volume, and NodeUnstageVolume tears it down once the last volume is
+	// unstaged. Serialize its whole lifecycle -- marker accounting and
+	// mount/unmount together -- so it cannot be rebuilt underneath a volume
+	// that is already published on it. See acquireRootMountLock.
+	unlock, lockErr := d.acquireRootMountLock(ctx)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer unlock()
+
 	// Step 1: Create a marker file for each new volume comming in.
-	// Create marker for this volume
+	// Create marker for this volume. This is what keeps NodeUnstageVolume from
+	// unmounting the root export while this volume still needs it, so a marker
+	// we failed to write is not something to continue past.
 	if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-		log.Warnf("Failed to create marker root directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
+		return nil, status.Errorf(codes.Internal, "create volume marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
 	}
 
 	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
 
-	err = os.WriteFile(marker, []byte(""), 0644)
-	if err != nil {
-		log.Warnf("Not able to create marker file path %s err %v", marker, err)
+	if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
+		return nil, status.Errorf(codes.Internal, "write volume marker %s: %v", marker, err)
 	}
 
 	// Step 2: Ensure the root NFS export is mounted once per node
@@ -250,19 +263,33 @@ func (d *CSIDriver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageV
 		"staging_target": stagingTarget,
 	}).Debug("NodeUnstageVolume will remove the any volume mounted counter, and at last delete base hs mount.")
 
+	// Held for the same reason as in NodeStageVolume: dropping this volume's
+	// marker and acting on the resulting count must not interleave with another
+	// volume staging or publishing on the shared root export.
+	unlock, lockErr := d.acquireRootMountLock(ctx)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer unlock()
+
 	// Step 1: Remove volume marker unstage request comes in.
 	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
 
 	// 1. Delete marker.txt for this volume
 	log.Debugf("Removing volume marker %s", marker)
-	_ = os.Remove(marker)
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		// Leaving a marker behind pins the root mount forever; leaving one we
+		// think we removed but did not would be worse, so surface it.
+		return nil, status.Errorf(codes.Internal, "remove volume marker %s: %v", marker, err)
+	}
 	log.Debugf("Removed volume marker %s", marker)
 	// 2. If marker tree is now empty, clean up root
 	if !IsAnyVolumeStillMounted(common.BaseVolumeMarkerSourcePath) {
 		// if no volume are mounted
 		log.Debugf("No volume marker is present on this node. Remove root mount as well..")
-		_ = os.RemoveAll(common.BaseVolumeMarkerSourcePath)
-		_ = common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath)
+		if err := common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "unmount root export: %v", err)
+		}
 	}
 	log.WithFields(log.Fields{
 		"volume_id":      volumeID,
@@ -509,13 +536,11 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 	}
 
 	// Find Share
-	typeMount := false
 	fileBacked := false
 
 	volumeName := GetVolumeNameFromPath(req.GetVolumeId())
 	share, _ := d.hsclient.GetShare(ctx, volumeName)
 	if share != nil {
-		typeMount = true
 		if isMounted := common.IsShareMounted(share.ExportPath); !isMounted {
 			return nil, status.Error(codes.FailedPrecondition, common.ShareNotMounted)
 		}
@@ -535,25 +560,22 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 			fileBacked = true
 		}
 	}
-	switch req.GetVolumeCapability().GetAccessType().(type) {
-	case *csi.VolumeCapability_Block:
-		typeMount = false
-	case *csi.VolumeCapability_Mount:
-		typeMount = true
-	}
-
 	if fileBacked {
 		// Ensure it's file-backed, otherwise no-op
 		// Resize device
-		err := common.ExpandDeviceFileSize(common.ShareStagingDir+req.GetVolumeId(), requestedSize)
+		backingFile := common.ShareStagingDir + req.GetVolumeId()
+		err := common.ExpandDeviceFileSize(backingFile, requestedSize)
 		if err != nil {
 			return nil, err
 		}
-		if typeMount {
-			if req.GetVolumePath() == "" {
-				return nil, status.Error(codes.InvalidArgument, common.EmptyVolumePath)
-			}
-			err = common.ExpandFilesystem(req.GetVolumePath(), req.VolumeCapability.GetMount().FsType)
+		fsType, err := nodeExpansionFilesystemType(req, backingFile)
+		if err != nil {
+			return nil, err
+		}
+		if fsType != "" {
+			// xfs_growfs takes the mount point, but resize2fs needs the
+			// underlying loop device, not a directory.
+			err = common.ExpandMountedFilesystem(req.GetVolumePath(), backingFile, fsType)
 			if err != nil {
 				return nil, err
 			}
@@ -568,4 +590,32 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 	} else {
 		return nil, nil
 	}
+}
+
+// nodeExpansionFilesystemType determines whether NodeExpandVolume must grow a
+// filesystem and, if so, which one. volume_capability is optional in the CSI
+// specification, so kubelet may provide only volume_path. In that case inspect
+// the path and loop device rather than silently treating the request as a raw
+// block expansion.
+func nodeExpansionFilesystemType(req *csi.NodeExpandVolumeRequest, backingFile string) (string, error) {
+	if mountCapability := req.GetVolumeCapability().GetMount(); mountCapability != nil {
+		if req.GetVolumePath() == "" {
+			return "", status.Error(codes.InvalidArgument, common.EmptyVolumePath)
+		}
+		if mountCapability.GetFsType() != "" {
+			return mountCapability.GetFsType(), nil
+		}
+	}
+	if _, isBlock := req.GetVolumeCapability().GetAccessType().(*csi.VolumeCapability_Block); isBlock {
+		return "", nil
+	}
+	if req.GetVolumePath() == "" {
+		return "", status.Error(codes.InvalidArgument, common.EmptyVolumePath)
+	}
+
+	fsType, err := filesystemType(backingFile)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "could not determine filesystem type at %q: %v", req.GetVolumePath(), err)
+	}
+	return fsType, nil
 }
