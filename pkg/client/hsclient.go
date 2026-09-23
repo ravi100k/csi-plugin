@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -589,8 +590,12 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 
 	// Iterate over each share
 	for _, share := range shares {
-		// Skip shares that don't match the provided volume_id (if specified)
-		if volume_id != "" && share.Name != volume_id {
+		// Skip shares that don't match the provided volume_id (if specified).
+		// The CO identifies a share-backed volume by its EXPORT PATH ("/pvc-x"),
+		// not the bare share name ("pvc-x"), so compare against the path -- and
+		// against the same value reported as SourceVolumeId below, or filtering
+		// by source_volume_id silently matches nothing.
+		if volume_id != "" && path.Clean(share.ExportPath) != path.Clean(volume_id) {
 			continue
 		}
 
@@ -610,10 +615,19 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 
 		// Iterate over the snapshots in the /.snapshot/ directory
 		for _, snapshotFile := range shareFile.Children {
+			// "current" is the live view of the share, not a snapshot. The
+			// snapshot-list API prunes it (see GetShareSnapshots); reading the
+			// directory directly has to prune it here.
+			if snapshotFile.Name == "current" {
+				continue
+			}
 			snapshot := common.SnapshotResponse{
-				Id:             snapshotFile.Name,
+				Id: snapshotFile.Name,
+				// The CO identifies a volume by its CSI volume ID, which for a
+				// share-backed volume is the share's export path, not the bare
+				// share name -- callers filter on this.
+				SourceVolumeId: share.ExportPath,
 				Created:        snapshotFile.CreateTime,
-				SourceVolumeId: share.Name,
 				ReadyToUse:     true, // Assume true if the snapshot exists
 				Size:           snapshotFile.Size,
 			}
@@ -966,6 +980,12 @@ func (client *HammerspaceClient) UpdateShareSize(ctx context.Context, name strin
 	if err != nil {
 		return errors.New(common.ShareNotFound)
 	}
+	// GetShareRawFields signals "no such share" as (nil, nil) on a 404, so a
+	// missing share reaches here with err == nil and a nil map. Writing to it
+	// panics the whole controller, taking every other in-flight RPC with it.
+	if share == nil {
+		return errors.New(common.ShareNotFound)
+	}
 
 	share["shareSizeLimit"] = size
 	shareString := new(bytes.Buffer)
@@ -1151,16 +1171,46 @@ func (client *HammerspaceClient) GetFileSnapshots(ctx context.Context, filePath 
 	return snapshots, nil
 }
 
-func (client *HammerspaceClient) DeleteFileSnapshot(ctx context.Context, filePath, snapshotName string) error {
-	// Snapshot paths have the form
-	// <source>/.fsnapshot/<timestamp>/<source-base-name>. Use the directory
-	// component, not path.Base(snapshotName), which is the source file name.
-	snapshotDir := path.Base(path.Dir(snapshotName))
-	parts := strings.SplitN(snapshotDir, "-", 6)
-	if len(parts) < 5 {
-		return fmt.Errorf("invalid file snapshot name %q", snapshotName)
+// fileSnapshotTimestampPattern matches the date-time component of a file
+// snapshot path, e.g. "2026-09-23T08-25-16-0644-0".
+var fileSnapshotTimestampPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
+
+// fileSnapshotTimestamp extracts the date-time expression the delete API needs
+// from a file snapshot's path.
+//
+// Hammerspace lays these out as
+//
+//	<share>/.fsnapshot/<source-file-name>/<timestamp>
+//
+// so the timestamp is the LAST component, not the second-to-last. Reading the
+// wrong component yielded the source FILE NAME, which was then truncated into a
+// nonsense "date" ("hscsi-cert-block-20260923-pvc"). The API matched no
+// snapshot, answered 400, and the caller treats 400 as success -- so every file
+// snapshot silently survived its own deletion, and DeleteVolume then refused
+// forever with VolumeDeleteHasSnapshots because the snapshot was still there.
+//
+// Both positions are still checked, since an earlier layout put the timestamp
+// first, and a name matching neither is an error rather than a silent no-op.
+func fileSnapshotTimestamp(snapshotName string) (string, error) {
+	for _, candidate := range []string{path.Base(snapshotName), path.Base(path.Dir(snapshotName))} {
+		if !fileSnapshotTimestampPattern.MatchString(candidate) {
+			continue
+		}
+		// "2026-09-23T08-25-16-0644-0" -> "2026-09-23T08-25-16"
+		parts := strings.SplitN(candidate, "-", 6)
+		if len(parts) < 5 {
+			continue
+		}
+		return strings.Join(parts[0:5], "-"), nil
 	}
-	snapshotTime := strings.Join(parts[0:5], "-")
+	return "", fmt.Errorf("could not find a timestamp in file snapshot name %q", snapshotName)
+}
+
+func (client *HammerspaceClient) DeleteFileSnapshot(ctx context.Context, filePath, snapshotName string) error {
+	snapshotTime, err := fileSnapshotTimestamp(snapshotName)
+	if err != nil {
+		return err
+	}
 
 	req, _ := client.generateRequest(ctx, "POST",
 		fmt.Sprintf("/file-snapshots/delete?filename-expression=%s&date-time-expression=%s", url.PathEscape(filePath), url.PathEscape(snapshotTime)), "")

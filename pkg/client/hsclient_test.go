@@ -590,3 +590,69 @@ func TestClusterCapacityRejectsMalformedOrMissingCapacity(t *testing.T) {
 		})
 	}
 }
+
+// GetShareRawFields reports a missing share as (nil, nil), so UpdateShareSize
+// used to write into a nil map and panic the entire controller process rather
+// than returning an error for one RPC.
+func TestUpdateShareSizeReturnsErrorForMissingShare(t *testing.T) {
+	setupHTTP()
+	defer tearDownHTTP()
+
+	Mux.HandleFunc(BasePath+"/shares/gone", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	})
+
+	err := hsclient.UpdateShareSize(context.Background(), "gone", 1073741824)
+	if err == nil {
+		t.Fatal("expected an error for a share that does not exist")
+	}
+	if err.Error() != common.ShareNotFound {
+		t.Fatalf("expected %q, got %q", common.ShareNotFound, err.Error())
+	}
+}
+
+// Hammerspace lays file snapshots out as <share>/.fsnapshot/<file>/<timestamp>,
+// so the timestamp is the LAST path component. Reading the second-to-last one
+// yielded the source file name, which was silently truncated into a nonsense
+// "date" -- the API then matched nothing, returned 400, and the caller treated
+// that as success, so snapshots survived deletion and blocked DeleteVolume.
+func TestFileSnapshotTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snapshot string
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "current layout: timestamp last",
+			snapshot: "/share/.fsnapshot/hscsi-cert-block-20260923-pvc-f397f67e-b54a-4a6d/2026-09-23T08-25-16-0644-0",
+			want:     "2026-09-23T08-25-16",
+		},
+		{
+			name:     "legacy layout: timestamp first",
+			snapshot: "/share/.fsnapshot/2026-09-23T08-25-16-0644-0/my-volume-file",
+			want:     "2026-09-23T08-25-16",
+		},
+		{
+			name:     "no timestamp anywhere is an error, not a silent no-op",
+			snapshot: "/share/.fsnapshot/some-file/another-file",
+			wantErr:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := fileSnapshotTimestamp(tc.snapshot)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("timestamp = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
