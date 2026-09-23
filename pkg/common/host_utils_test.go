@@ -224,3 +224,216 @@ func TestExpandDeviceFileSizeOrdering(t *testing.T) {
 		t.Errorf("losetup -c target = %q, want %s", got, loopdev)
 	}
 }
+
+// ReconcileFilesystemToBackingFile must refresh the loop device before growing
+// the filesystem, must never pass a target size, and must hand xfs_growfs the
+// mount point while handing resize2fs the loop device.
+func TestReconcileFilesystemToBackingFile(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	for _, tc := range []struct {
+		fsType      string
+		wantGrowCmd string
+		wantGrowArg string
+	}{
+		{fsType: "xfs", wantGrowCmd: "xfs_growfs", wantGrowArg: "/var/lib/kubelet/target"},
+		{fsType: "ext4", wantGrowCmd: "resize2fs", wantGrowArg: "/dev/loop3"},
+	} {
+		var calls [][]string
+		ExecCommand = func(command string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{command}, args...))
+			if command == "losetup" && len(args) == 1 && args[0] == "-a" {
+				return []byte("/dev/loop3: 0 /mnt/backing/vol\n"), nil
+			}
+			return []byte(""), nil
+		}
+
+		err := ReconcileFilesystemToBackingFile("/var/lib/kubelet/target", "/mnt/backing/vol", tc.fsType)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.fsType, err)
+		}
+
+		var refresh, grow []string
+		for _, call := range calls {
+			if call[0] == "losetup" && len(call) > 1 && call[1] == "-c" {
+				refresh = call
+			}
+			if call[0] == tc.wantGrowCmd {
+				grow = call
+			}
+		}
+		if refresh == nil {
+			t.Fatalf("%s: expected the loop device size to be refreshed, calls were %v", tc.fsType, calls)
+		}
+		if len(refresh) != 3 || refresh[2] != "/dev/loop3" {
+			t.Fatalf("%s: expected losetup -c /dev/loop3, got %v", tc.fsType, refresh)
+		}
+		if grow == nil {
+			t.Fatalf("%s: expected %s to run, calls were %v", tc.fsType, tc.wantGrowCmd, calls)
+		}
+		if len(grow) != 2 {
+			t.Fatalf("%s: expected %s to be called with exactly one argument (no target size), got %v",
+				tc.fsType, tc.wantGrowCmd, grow)
+		}
+		if grow[1] != tc.wantGrowArg {
+			t.Fatalf("%s: expected %s %s, got %v", tc.fsType, tc.wantGrowCmd, tc.wantGrowArg, grow)
+		}
+	}
+}
+
+// ExpandRawFileSize resizes only the raw file: no loop device is looked up or
+// refreshed, so it works from the controller, which has no loop device at all.
+func TestExpandRawFileSizeTouchesOnlyTheFile(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	var calls [][]string
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{command}, args...))
+		return []byte(""), nil
+	}
+
+	if err := ExpandRawFileSize("/mnt/backing/vol", 2147483648); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one command, got %v", calls)
+	}
+	expected := []string{"qemu-img", "resize", "-fraw", "/mnt/backing/vol", "2147483648"}
+	if !reflect.DeepEqual(calls[0], expected) {
+		t.Fatalf("expected %v, got %v", expected, calls[0])
+	}
+}
+
+// A volume's per-mount VFS flags must not be baked into the shared NFS mount
+// (where the first volume would impose them on every later one); they are
+// applied per volume by RemountBindOptions instead. Transport options must
+// survive, or the shared mount is established wrongly.
+func TestNFSRootMountOptionsKeepsOnlyTransportOptions(t *testing.T) {
+	got := NFSRootMountOptions([]string{"noatime", "nfsvers=4.2,hard", "ro", "timeo=600"})
+	expected := []string{"nfsvers=4.2", "hard", "timeo=600"}
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("expected %v, got %v", expected, got)
+	}
+	if NFSRootMountOptions(nil) != nil {
+		t.Fatal("expected no options for no flags")
+	}
+}
+
+func TestRemountBindOptionsAppliesOnlyVFSFlags(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	var got []string
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		got = append([]string{command}, args...)
+		return []byte(""), nil
+	}
+
+	if err := RemountBindOptions("/var/lib/hammerspace/rootmount", []string{"noatime", "nfsvers=4.2,nodev"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := []string{"mount", "-o", "remount,bind,rw,relatime,diratime,noatime,nodev", "/var/lib/hammerspace/rootmount"}
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("expected %v, got %v", expected, got)
+	}
+}
+
+// The per-mount flag list must cover every option the kernel lets a bind
+// remount change, and must exclude superblock and NFS transport options, which
+// a bind remount cannot change and which belong to the shared mount.
+func TestIsBindMountOptionCoversKernelPerMountFlags(t *testing.T) {
+	perMount := []string{
+		"ro", "rw", "nosuid", "suid", "nodev", "dev", "noexec", "exec",
+		"noatime", "atime", "nodiratime", "diratime",
+		"relatime", "norelatime", "strictatime", "nosymfollow", "symfollow",
+	}
+	for _, o := range perMount {
+		if !isBindMountOption(o) {
+			t.Errorf("%q is a per-mount kernel flag but is not classified as one, so it would leak onto the shared mount", o)
+		}
+	}
+	// Superblock options and NFS transport options must never be applied to a
+	// bind remount -- the kernel rejects them.
+	notPerMount := []string{"lazytime", "sync", "dirsync", "mand", "hard", "vers=4.1", "timeo=600", "nfsvers=4.2"}
+	for _, o := range notPerMount {
+		if isBindMountOption(o) {
+			t.Errorf("%q is not a per-mount flag but is classified as one; a bind remount would fail on it", o)
+		}
+	}
+}
+
+// An option we recognize as neither kind is the silent-failure case, so it must
+// be flagged. Known options of both kinds must not be.
+func TestUnknownMountOptionDetection(t *testing.T) {
+	for _, o := range []string{"noatime", "ro", "hard", "nolock", "vers=4.1", "timeo=600", ""} {
+		if unknownMountOption(o) {
+			t.Errorf("%q is recognized and should not be reported as unknown", o)
+		}
+	}
+	for _, o := range []string{"nofuturekernelflag", "somethingelse"} {
+		if !unknownMountOption(o) {
+			t.Errorf("%q is unrecognized and must be reported, or a future per-mount flag leaks silently", o)
+		}
+	}
+}
+
+func TestGetFilesystemTypeUsesDeviceSignature(t *testing.T) {
+	original := ExecCommand
+	defer func() { ExecCommand = original }()
+
+	const backing = "/mnt/backing/volume.img"
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		switch command {
+		case "losetup":
+			return []byte("/dev/loop7: [2049]:999 (" + backing + ")\n"), nil
+		case "blkid":
+			return []byte("btrfs\n"), nil
+		default:
+			t.Fatalf("unexpected command %q", command)
+			return nil, nil
+		}
+	}
+
+	fsType, err := GetFilesystemType(backing)
+	if err != nil {
+		t.Fatalf("GetFilesystemType returned error: %v", err)
+	}
+	if fsType != "btrfs" {
+		t.Fatalf("filesystem type = %q, want btrfs", fsType)
+	}
+}
+
+// Node-side expansion must hand each resize tool the target it accepts:
+// xfs_growfs the mount point, resize2fs the loop device. Passing the mount path
+// to resize2fs exits 1, which is how ext4 node expansion silently broke while
+// XFS kept working.
+func TestExpandMountedFilesystemTargetsPerFsType(t *testing.T) {
+	orig := ExecCommand
+	defer func() { ExecCommand = orig }()
+
+	const mountPath = "/var/lib/kubelet/pods/abc/volumes/kubernetes.io~csi/pvc-1/mount"
+	const backing = "/mnt/backing/pvc-1"
+
+	for _, tc := range []struct{ fsType, wantCmd, wantArg string }{
+		{"xfs", "xfs_growfs", mountPath},
+		{"ext4", "resize2fs", "/dev/loop9"},
+	} {
+		var got []string
+		ExecCommand = func(command string, args ...string) ([]byte, error) {
+			if command == "losetup" {
+				return []byte("/dev/loop9: 0 " + backing + "\n"), nil
+			}
+			got = append([]string{command}, args...)
+			return []byte(""), nil
+		}
+		if err := ExpandMountedFilesystem(mountPath, backing, tc.fsType); err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.fsType, err)
+		}
+		expected := []string{tc.wantCmd, tc.wantArg}
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("%s: expected %v, got %v", tc.fsType, expected, got)
+		}
+	}
+}

@@ -218,6 +218,168 @@ func ExpandFilesystem(device, fsType string) error {
 	return nil
 }
 
+// isBindMountOption reports whether a mount option is a per-mount VFS flag --
+// one the kernel stores on the mount itself rather than on the NFS superblock,
+// and therefore one a bind mount can carry independently of its source.
+//
+// This list is not arbitrary: it is exactly the set of options that map to the
+// kernel's PER-MOUNT MS_* flags, the only ones "mount -o remount,bind" can
+// change. It mirrors, one line per flag:
+//
+//	MS_RDONLY      ro / rw
+//	MS_NOSUID      nosuid / suid
+//	MS_NODEV       nodev / dev
+//	MS_NOEXEC      noexec / exec
+//	MS_NOATIME     noatime / atime
+//	MS_NODIRATIME  nodiratime / diratime
+//	MS_RELATIME    relatime / norelatime
+//	MS_STRICTATIME strictatime
+//	MS_NOSYMFOLLOW nosymfollow / symfollow   (Linux 5.10+)
+//
+// Superblock options (lazytime, sync, dirsync, mand) are deliberately absent:
+// they cannot be changed by a bind remount, and passing one to that remount
+// makes it fail. NFS transport options (vers, hard, timeo, rsize, proto) are
+// absent for the same reason -- they belong to the shared mount.
+//
+// If the kernel gains a new per-mount flag, add it here. Until then an
+// unrecognized flag is treated as a transport option, which means it ends up on
+// the SHARED mount where the first volume to use it imposes it on every volume
+// after -- silently. unknownMountOption exists to make that visible instead.
+// ExpandMountedFilesystem grows the filesystem of an already-mounted volume,
+// handing each resize tool the target it actually accepts.
+//
+// This is not interchangeable with ExpandFilesystem: xfs_growfs operates on the
+// MOUNT POINT, while resize2fs requires the underlying block device and exits 1
+// ("Couldn't find valid filesystem superblock") when handed a directory. Passing
+// the mount path for both means XFS volumes expand and ext4 volumes always fail,
+// which is exactly how node-side expansion of ext4 file-backed volumes broke.
+//
+// backingFile is the raw file behind the volume; its loop device is resolved
+// here for the non-XFS case. The caller is responsible for having already grown
+// the backing file and refreshed the loop device (ExpandDeviceFileSize).
+func ExpandMountedFilesystem(targetPath, backingFile, fsType string) error {
+	if fsType == "xfs" {
+		return ExpandFilesystem(targetPath, fsType)
+	}
+	loopdev, err := determineLoopDeviceFromBackingFile(backingFile)
+	if err != nil {
+		return err
+	}
+	return ExpandFilesystem(loopdev, fsType)
+}
+
+func isBindMountOption(option string) bool {
+	switch option {
+	case "ro", "rw",
+		"nosuid", "suid",
+		"nodev", "dev",
+		"noexec", "exec",
+		"noatime", "atime",
+		"nodiratime", "diratime",
+		"relatime", "norelatime",
+		"strictatime",
+		"nosymfollow", "symfollow":
+		return true
+	}
+	return false
+}
+
+// knownNFSMountOption reports whether a bare-word option (one with no "=") is a
+// recognized NFS transport option. Options of the form key=value are always
+// transport options, so they never reach this.
+func knownNFSMountOption(option string) bool {
+	switch option {
+	case "hard", "soft", "softerr", "ac", "noac", "bg", "fg", "intr", "nointr",
+		"lock", "nolock", "cto", "nocto", "resvport", "noresvport",
+		"sharecache", "nosharecache", "tcp", "udp", "rdma", "posix",
+		"acl", "noacl", "rdirplus", "nordirplus", "migration", "nomigration",
+		"local_lock", "nconnect", "fatal_neterrors", "trunkdiscovery", "notrunkdiscovery":
+		return true
+	}
+	return false
+}
+
+// unknownMountOption reports a bare-word mount option that is neither a known
+// per-mount VFS flag nor a known NFS transport option. Such an option is
+// assumed to be a transport option and lands on the shared mount; if it is
+// really a VFS flag the kernel has since gained, that silently reintroduces the
+// cross-volume flag leak isBindMountOption exists to prevent. Callers log it so
+// the gap surfaces in driver logs rather than as mysterious mount behaviour.
+func unknownMountOption(option string) bool {
+	if option == "" || strings.Contains(option, "=") {
+		return false
+	}
+	return !isBindMountOption(option) && !knownNFSMountOption(option)
+}
+
+// NFSRootMountOptions strips the per-volume VFS flags from a volume's mount
+// options, leaving the NFS transport options that the shared root/backing mount
+// can legitimately be established with. The stripped flags are applied
+// per-volume by RemountBindOptions instead, so the first volume to trigger the
+// shared mount cannot impose its own flags on every volume that follows.
+func NFSRootMountOptions(flags []string) []string {
+	var options []string
+	for _, flag := range flags {
+		for _, option := range strings.Split(flag, ",") {
+			if isBindMountOption(option) {
+				continue
+			}
+			if unknownMountOption(option) {
+				log.Warnf("mount option %q is not a recognized NFS transport option or per-mount VFS flag; "+
+					"treating it as a transport option, so it will apply to the SHARED mount rather than to this volume alone. "+
+					"If it is a per-mount flag, add it to isBindMountOption.", option)
+			}
+			options = append(options, option)
+		}
+	}
+	return options
+}
+
+// RemountBindOptions sets the VFS flags on an existing mount in this namespace.
+//
+// It must be applied to the SOURCE of a bind, before the bind is created.
+// Remounting the bind TARGET afterwards cannot work across the container/host
+// mount-namespace boundary that the node plugin's Bidirectional mount
+// propagation sets up: that boundary propagates mount and unmount topology
+// events, not flag-only remounts of an already-propagated mount. A bind created
+// after this remount is itself a new topology event, so it carries the source's
+// current flags with it.
+func RemountBindOptions(target string, flags []string) error {
+	opts := []string{"remount", "bind", "rw", "relatime", "diratime"}
+	for _, flag := range flags {
+		for _, option := range strings.Split(flag, ",") {
+			if isBindMountOption(option) {
+				opts = append(opts, option)
+			}
+		}
+	}
+	output, err := ExecCommand("mount", "-o", strings.Join(opts, ","), target)
+	if err != nil {
+		log.Errorf("could not remount %s with options %v: %s: %v", target, opts, output, err)
+	}
+	return err
+}
+
+// GetFilesystemType identifies the filesystem from the loop device's on-disk
+// signature. This avoids maintaining a filesystem-magic allowlist and works
+// even when a replacement CSI node container cannot see kubelet's existing
+// mount in its own mount namespace. An empty result means a raw block volume.
+func GetFilesystemType(backingFile string) (string, error) {
+	loopDevice, err := determineLoopDeviceFromBackingFile(backingFile)
+	if err != nil {
+		return "", err
+	}
+	output, err := ExecCommand("blkid", "-p", "-s", "TYPE", "-o", "value", loopDevice)
+	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 2 {
+			return "", nil // blkid: no recognizable filesystem signature
+		}
+		return "", fmt.Errorf("could not determine filesystem type on %q: %w", loopDevice, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func BindMountDevice(sourcefile, destfile string) error {
 	mounter := mount.New("")
 	// Check if the file already exists
@@ -280,7 +442,6 @@ func MakeEmptyRawFile(ctx context.Context, pathname string, size int64) error {
 
 func ExpandDeviceFileSize(pathname string, size int64) error {
 	log.Infof("resizing device file '%s'", pathname)
-	sizeStr := strconv.FormatInt(size, 10)
 	loopdev, err := determineLoopDeviceFromBackingFile(pathname)
 	if err != nil {
 		// log.Errorf("DFERR: loopdev: '%s', error: '%v'", loopdev, err.Error())
@@ -292,19 +453,69 @@ func ExpandDeviceFileSize(pathname string, size int64) error {
 	// loop device is left reporting the old size, so the caller's resize2fs/xfs_growfs
 	// is a no-op — the first NodeExpandVolume fails for ext4/xfs (and silently under-
 	// sizes a block device, which has no filesystem check to catch it) until a retry.
+	if err := ExpandRawFileSize(pathname, size); err != nil {
+		return err
+	}
+	// Refresh the loop device size with losetup -c. Requires UBI image.
+	return refreshLoopDeviceSize(loopdev)
+}
+
+// ExpandRawFileSize grows the raw backing file itself. It does not touch any
+// attached loop device or mounted filesystem, so it is the only resize step
+// available to a caller that reaches the file over NFS but has no local loop
+// device — such as the controller growing a file-backed volume's backing file
+// right after restoring it from a snapshot at a larger requested capacity.
+func ExpandRawFileSize(pathname string, size int64) error {
+	log.Infof("resizing raw file '%s' to %d bytes", pathname, size)
+	sizeStr := strconv.FormatInt(size, 10)
 	output, err := ExecCommand("qemu-img", "resize", "-fraw", pathname, sizeStr)
 	if err != nil {
 		log.Errorf("%s, %v", output, err.Error())
 		return err
 	}
-	// Refresh the loop device size with losetup -c
-	// Requires UBI image
-	loresize, err := ExecCommand("losetup", "-c", loopdev)
+	return nil
+}
+
+// refreshLoopDeviceSize makes the kernel re-read a loop device's CURRENT
+// backing-file size (losetup -c / LOOP_SET_CAPACITY). It never changes the
+// backing file's own size.
+func refreshLoopDeviceSize(loopdev string) error {
+	output, err := ExecCommand("losetup", "-c", loopdev)
 	if err != nil {
-		log.Errorf("Resizing loop device '%s' failed with output '%s': '%v'", loopdev, loresize, err.Error())
+		log.Errorf("Resizing loop device '%s' failed with output '%s': '%v'", loopdev, output, err.Error())
 		return err
 	}
 	return nil
+}
+
+// ReconcileFilesystemToBackingFile grows the filesystem at targetPath to use
+// whatever space is CURRENTLY available in its backing file, without ever
+// changing the backing file's own size — growing the raw file is the
+// controller's job, at CreateVolume/ControllerExpandVolume time.
+//
+// It deliberately takes no target size. A caller-supplied size (for example
+// the CSI VolumeContext "size") is fixed at volume creation and is not
+// updated by a later expansion, so resizing toward it could shrink an
+// already-expanded volume. Instead it refreshes the loop device from the
+// backing file's actual current size and then grows the filesystem with no
+// explicit target: resize2fs and xfs_growfs both grow to fill all the space
+// the device reports. Both steps are idempotent — a no-op, not an error, when
+// there is nothing to grow — so this is safe to call unconditionally on every
+// publish of a file-backed mount volume, with no size pre-check.
+func ReconcileFilesystemToBackingFile(targetPath, backingFile, fsType string) error {
+	loopdev, err := determineLoopDeviceFromBackingFile(backingFile)
+	if err != nil {
+		return err
+	}
+	if err := refreshLoopDeviceSize(loopdev); err != nil {
+		return err
+	}
+	// xfs_growfs takes the mount point; resize2fs needs the underlying block
+	// device and fails when handed a directory.
+	if fsType == "xfs" {
+		return ExpandFilesystem(targetPath, fsType)
+	}
+	return ExpandFilesystem(loopdev, fsType)
 }
 
 func FormatDevice(ctx context.Context, device, fsType string) error {
