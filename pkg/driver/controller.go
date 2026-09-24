@@ -353,7 +353,7 @@ func (d *CSIDriver) ensureShareBackedVolumeExists(ctx context.Context, hsVolume 
 	defer common.UnmountFilesystem(ctx, targetPath)
 
 	log.Debugf("Created empty folder with path %s", targetPath)
-	err = d.publishShareBackedVolume(ctx, hsVolume.Path, targetPath, hsVolume.MountFlags, hsVolume.FQDN)
+	err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, hsVolume.FQDN)
 	if err != nil {
 		log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 	} else {
@@ -410,7 +410,7 @@ func (d *CSIDriver) ensureBackingShareExists(ctx context.Context, backingShareNa
 		// generate unique target path on host for setting file metadata
 		targetPath := common.ShareStagingDir + "/metadata-mounts" + hsVolume.Path
 		defer common.UnmountFilesystem(ctx, targetPath)
-		err = d.publishShareBackedVolume(ctx, hsVolume.Path, targetPath, hsVolume.MountFlags, hsVolume.FQDN)
+		err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, hsVolume.FQDN)
 		if err != nil {
 			log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 		}
@@ -1389,6 +1389,28 @@ func (d *CSIDriver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest
 	}, nil
 }
 
+// cachedClusterAvailableCapacity returns the cluster's free capacity, preferring
+// the cached figure.
+//
+// GetClusterAvailableCapacity always queries the Anvil (~1.5s measured) and
+// refreshes the cache as a side effect. That is too slow for GetCapacity: the
+// external provisioner refreshes CSIStorageCapacity for every StorageClass
+// serially, so with dozens of classes alive a newly created one waits behind
+// the queue for longer than the CSI capacity test's 60s budget -- and, more
+// importantly, longer than a scheduler will wait before treating every node as
+// out of storage.
+//
+// Capacity is advisory for scheduling, so a slightly stale figure published
+// promptly beats an exact one published late.
+func (d *CSIDriver) cachedClusterAvailableCapacity(ctx context.Context) (int64, error) {
+	if cached, err := common.GetCacheData("FREE_CAPACITY"); err == nil && cached != nil {
+		if free, ok := cached.(int64); ok {
+			return free, nil
+		}
+	}
+	return d.hsclient.GetClusterAvailableCapacity(ctx)
+}
+
 func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	// Start a span for tracing
 	ctx, span := tracer.Start(ctx, "Controller/GetCapacity", trace.WithAttributes())
@@ -1435,14 +1457,14 @@ func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 			available = backingShare.Space.Available
 		} else {
 			// Not created yet; it will be carved from cluster capacity.
-			available, err = d.hsclient.GetClusterAvailableCapacity(ctx)
+			available, err = d.cachedClusterAvailableCapacity(ctx)
 			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 		}
 	} else {
 		// Return all capacity of cluster for share backed volumes
-		available, err = d.hsclient.GetClusterAvailableCapacity(ctx)
+		available, err = d.cachedClusterAvailableCapacity(ctx)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}

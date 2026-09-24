@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -10,13 +11,16 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Every entry point that mounts, unmounts, or binds off the node-wide root
-// export must contend on one lock, or an unstage can tear the export down
-// underneath a volume that is already published on it -- the ESTALE race that
-// broke subPath. Holding the lock externally and checking each RPC gives up on
-// it proves they all take the same one; none of them can reach real mount
-// syscalls here, because none of them get past the lock.
-func TestRootMountLifecycleSharesOneLock(t *testing.T) {
+// Only volumes staged by a driver version that still mounted the node-wide
+// root export leave a marker behind, so only their unstage may take the root
+// mount lock. Everything else must stage and unstage without contending on it.
+// The lock is held externally throughout; an RPC that tried to take it would
+// fail with Aborted on the already-cancelled context.
+func TestRootMountLockTakenOnlyForLegacyMarkers(t *testing.T) {
+	origMarkers := common.BaseVolumeMarkerSourcePath
+	common.BaseVolumeMarkerSourcePath = t.TempDir()
+	defer func() { common.BaseVolumeMarkerSourcePath = origMarkers }()
+
 	d := &CSIDriver{volumeLocks: make(map[string]*keyLock)}
 	unlock, err := d.acquireRootMountLock(context.Background())
 	if err != nil {
@@ -24,31 +28,40 @@ func TestRootMountLifecycleSharesOneLock(t *testing.T) {
 	}
 	defer unlock()
 
-	// Already-cancelled, so a contending caller gives up immediately instead of
-	// waiting out the lock's full timeout.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	staging := t.TempDir()
 
+	// A file-backed volume has nothing to stage: its backing share is mounted
+	// at publish time.
 	capability := &csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "nfs"}},
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+	}
+	if _, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+		VolumeId: "/backing/file", StagingTargetPath: staging, VolumeCapability: capability,
+		VolumeContext: map[string]string{"mountBackingShareName": "backing", "fsType": "ext4"},
+	}); err != nil {
+		t.Fatalf("staging a file-backed volume should be a no-op: %v", err)
+	}
+	if entries, _ := os.ReadDir(common.BaseVolumeMarkerSourcePath); len(entries) != 0 {
+		t.Fatalf("staging must not write root-export markers, found %d", len(entries))
 	}
 
-	_, err = d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
-		VolumeId: "/share", StagingTargetPath: "/unused", VolumeCapability: capability,
-	})
-	if status.Code(err) != codes.Aborted {
-		t.Fatalf("NodeStageVolume did not take the root mount lock: %v", err)
+	if _, err := d.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{
+		VolumeId: "/backing/file", StagingTargetPath: staging,
+	}); err != nil {
+		t.Fatalf("unstaging a volume with no legacy marker should not need the root lock: %v", err)
 	}
 
+	legacy := "/legacy-share"
+	if err := os.WriteFile(GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, legacy), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
 	_, err = d.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{
-		VolumeId: "/share", StagingTargetPath: "/unused",
+		VolumeId: legacy, StagingTargetPath: staging,
 	})
 	if status.Code(err) != codes.Aborted {
-		t.Fatalf("NodeUnstageVolume did not take the root mount lock: %v", err)
-	}
-
-	if err := d.publishShareBackedVolume(ctx, "/share", "/unused", nil, ""); status.Code(err) != codes.Aborted {
-		t.Fatalf("publishShareBackedVolume did not take the root mount lock: %v", err)
+		t.Fatalf("unstaging a legacy-staged volume must take the root mount lock: %v", err)
 	}
 }
 

@@ -93,7 +93,7 @@ func (d *CSIDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolu
 	// Check if path exists
 	info, err := statVolumePath(req.GetVolumePath())
 	if err != nil {
-		if errors.Is(err, syscall.EIO) {
+		if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
 			log.Errorf("volume path is inaccessible due to an I/O error: %s, err: %v", req.GetVolumePath(), err)
 			return nil, status.Errorf(codes.Unavailable,
 				"volume path %s is inaccessible due to an I/O error; filesystem teardown and retry are required",
@@ -173,6 +173,31 @@ func (d *CSIDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolu
 	}, nil
 }
 
+// nodeVolumeFsType resolves a volume's filesystem type. NodeStageVolume and
+// NodePublishVolume MUST agree on it: stage decides whether to mount the share
+// at the staging path, and publish decides whether to bind from that path. When
+// they disagreed, a pre-provisioned PV with no fsType was staged via the old
+// root-export path (nothing mounted at the staging path) but published as
+// native NFS, so the pod silently got an empty directory on the node's local
+// disk instead of the Hammerspace share.
+//
+// Precedence: the capability's fsType, then the StorageClass-derived volume
+// context, then "nfs" -- the driver's default for filesystem volumes. A raw
+// block volume has no filesystem and resolves to "".
+func nodeVolumeFsType(capability *csi.VolumeCapability, volumeContext map[string]string) string {
+	mountCapability := capability.GetMount()
+	if mountCapability == nil {
+		return ""
+	}
+	if mountCapability.GetFsType() != "" {
+		return mountCapability.GetFsType()
+	}
+	if fsType := volumeContext["fsType"]; fsType != "" {
+		return fsType
+	}
+	return "nfs"
+}
+
 func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (_ *csi.NodeStageVolumeResponse, err error) {
 	ctx, span := tracer.Start(ctx, "Node/NodeStageVolume", trace.WithAttributes(
 		attribute.String("volume.id", req.GetVolumeId()),
@@ -195,49 +220,27 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
 	}
 
-	log.WithFields(log.Fields{
-		"volume_id":      volumeID,
-		"staging_target": stagingTarget,
-	}).Debug("NodeStageVolume will only stage hammerspace root share to use bind on future publish call.")
-
 	mountFlags := []string{}
 	if volumeCapability.GetMount() != nil {
 		mountFlags = append(mountFlags, volumeCapability.GetMount().MountFlags...)
 	}
+	fsType := nodeVolumeFsType(volumeCapability, volumeContext)
 
-	// The root export is a single node-wide mount shared by every share-backed
-	// volume, and NodeUnstageVolume tears it down once the last volume is
-	// unstaged. Serialize its whole lifecycle -- marker accounting and
-	// mount/unmount together -- so it cannot be rebuilt underneath a volume
-	// that is already published on it. See acquireRootMountLock.
-	unlock, lockErr := d.acquireRootMountLock(ctx)
-	if lockErr != nil {
-		return nil, lockErr
-	}
-	defer unlock()
-
-	// Step 1: Create a marker file for each new volume comming in.
-	// Create marker for this volume. This is what keeps NodeUnstageVolume from
-	// unmounting the root export while this volume still needs it, so a marker
-	// we failed to write is not something to continue past.
-	if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-		return nil, status.Errorf(codes.Internal, "create volume marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
+	// A native share-backed NFS volume is staged as one direct NFS mount per
+	// volume per node. NodePublishVolume binds this mount into each pod. This is
+	// the standard CSI topology and avoids both one NFS mount per pod and the
+	// Hammerspace root-export junction that returns ESTALE for file subPaths.
+	if fsType == "nfs" && volumeContext["mountBackingShareName"] == "" {
+		if err := d.MountShareAtBestDataportal(ctx, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
+			return nil, err
+		}
+		log.Infof("Staged native NFS share %s at %s", volumeID, stagingTarget)
+		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
-
-	if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
-		return nil, status.Errorf(codes.Internal, "write volume marker %s: %v", marker, err)
-	}
-
-	// Step 2: Ensure the root NFS export is mounted once per node
-	// EnsureRootExportMounted function will do a mount check before mounting or creating dir.
-	if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, volumeContext["fqdn"]); err != nil {
-		return nil, status.Errorf(codes.Internal, "root export mount failed: %v", err)
-	}
-
-	log.Infof("[NodeStageVolume] completed mounting base HS share.")
-
+	// File-backed, block, and NFS-in-backing-share volumes have nothing to stage:
+	// NodePublishVolume mounts their backing share (EnsureBackingShareMounted)
+	// and reaches the backing file through it.
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -258,44 +261,46 @@ func (d *CSIDriver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageV
 		return nil, status.Error(codes.InvalidArgument, "Staging target path missing")
 	}
 
-	log.WithFields(log.Fields{
-		"volume_id":      volumeID,
-		"staging_target": stagingTarget,
-	}).Debug("NodeUnstageVolume will remove the any volume mounted counter, and at last delete base hs mount.")
+	// Native NFS volumes have a real mount at the CSI staging path. Other volume
+	// types leave it empty.
+	mounted, mountErr := common.SafeIsMountPoint(stagingTarget)
+	if mountErr == nil && mounted {
+		if err := common.UnmountFilesystem(ctx, stagingTarget); err != nil {
+			return nil, status.Errorf(codes.Internal, "unmount NFS staging target: %v", err)
+		}
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+	if errors.Is(mountErr, syscall.EIO) || errors.Is(mountErr, syscall.ESTALE) {
+		if err := forceUnmountTarget(stagingTarget); err != nil {
+			return nil, status.Errorf(codes.Internal, "force-unmount stale NFS staging target: %v", err)
+		}
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
 
-	// Held for the same reason as in NodeStageVolume: dropping this volume's
-	// marker and acting on the resulting count must not interleave with another
-	// volume staging or publishing on the shared root export.
+	// Upgrade cleanup. Driver versions before the staged-NFS design mounted a
+	// node-wide root export at stage time and wrote a marker per staged volume.
+	// This driver no longer writes markers, so a marker here belongs to a volume
+	// staged by an older version: drop it, and unmount the root export once the
+	// last such volume is gone.
+	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
+	if _, statErr := os.Stat(marker); os.IsNotExist(statErr) {
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
 	unlock, lockErr := d.acquireRootMountLock(ctx)
 	if lockErr != nil {
 		return nil, lockErr
 	}
 	defer unlock()
 
-	// Step 1: Remove volume marker unstage request comes in.
-	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
-
-	// 1. Delete marker.txt for this volume
-	log.Debugf("Removing volume marker %s", marker)
 	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-		// Leaving a marker behind pins the root mount forever; leaving one we
-		// think we removed but did not would be worse, so surface it.
 		return nil, status.Errorf(codes.Internal, "remove volume marker %s: %v", marker, err)
 	}
-	log.Debugf("Removed volume marker %s", marker)
-	// 2. If marker tree is now empty, clean up root
 	if !IsAnyVolumeStillMounted(common.BaseVolumeMarkerSourcePath) {
-		// if no volume are mounted
-		log.Debugf("No volume marker is present on this node. Remove root mount as well..")
 		if err := common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath); err != nil {
 			return nil, status.Errorf(codes.Internal, "unmount root export: %v", err)
 		}
 	}
-	log.WithFields(log.Fields{
-		"volume_id":      volumeID,
-		"staging_target": stagingTarget,
-	}).Info("Unstaged volume")
-
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -348,13 +353,7 @@ func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 		backingShareName = volumeContext["blockBackingShareName"]
 	case *csi.VolumeCapability_Mount:
 		backingShareName = volumeContext["mountBackingShareName"]
-		fsType = volumeCapability.GetMount().FsType
-		if fsType == "" {
-			fsType = volumeContext["fsType"]
-			if fsType == "" {
-				fsType = "nfs"
-			}
-		}
+		fsType = nodeVolumeFsType(volumeCapability, volumeContext)
 		mountFlags = append([]string{}, volumeCapability.GetMount().MountFlags...)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, common.NoCapabilitiesSupplied, volume_id)
@@ -367,7 +366,7 @@ func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 			"Volume_id":         volume_id,
 			"Traget Path":       targetPath,
 		}).Info("Starting node publish volume for Share backed NFS volume without backing share.")
-		err := d.publishShareBackedVolume(ctx, volume_id, targetPath, mountFlags, volumeContext["fqdn"])
+		err := d.publishShareBackedVolume(ctx, volume_id, req.GetStagingTargetPath(), targetPath, mountFlags, volumeContext["fqdn"])
 		if err != nil {
 			return nil, err
 		}
@@ -433,8 +432,8 @@ func (d *CSIDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubl
 			log.Infof("target path does not exist on this host: %s", targetPath)
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
-		if errors.Is(err, syscall.EIO) {
-			log.Warnf("target path %s returned EIO; force-detaching shut-down filesystem", targetPath)
+		if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
+			log.Warnf("target path %s is not stat-able (%v); force-detaching filesystem", targetPath, err)
 			if unmountErr := forceUnmountTarget(targetPath); unmountErr != nil {
 				return nil, status.Errorf(codes.Internal,
 					"failed to clean up target path after I/O error: %v", unmountErr)

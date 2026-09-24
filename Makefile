@@ -1,5 +1,5 @@
 VERSION ?= $(shell cat ./VERSION)
-GITHASH ?= $(shell git describe --match nEvErMatch --always --abbrev=10 --dirty)
+GITHASH = $(shell git describe --match nEvErMatch --always --abbrev=10 --dirty)
 RELEASE ?= 1
 NAME=bin/hs-csi-plugin
 RUNTIME_BASE ?= runtime

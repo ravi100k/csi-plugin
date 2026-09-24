@@ -343,9 +343,9 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 // applyBackingShareMountFlags bakes a volume's per-volume VFS flags into the
 // shared backing mount, for the one volume type that is published by binding
 // straight off it: a nested NFS volume (fsType "nfs") inside a backing share.
-// As with the root export, the flags must be on the bind source before the bind
-// is made, and the first volume to mount the share must not fix them for the
-// rest.
+// The flags must be on the bind source before the bind is made, because a
+// flag-only remount of the bind target does not propagate out of the node
+// plugin's mount namespace (see RemountBindOptions).
 //
 // File-backed and block volumes share this mount only to reach their backing
 // file. Their own flags belong on the filesystem or loop device they publish,
@@ -723,117 +723,6 @@ func (d *CSIDriver) MountShareAtBestDataportal(ctx context.Context, shareExportP
 	}
 
 	return fmt.Errorf("could not mount to any data-portals")
-}
-
-func (d *CSIDriver) EnsureRootExportMounted(ctx context.Context, baseRootDirPath string, mountFlags []string, fqdn string) error {
-	var err error
-
-	log.Debugf("Check if %s is already mounted", baseRootDirPath)
-	if common.IsShareMounted(baseRootDirPath) {
-		log.Debugf("Root dir mount is already mounted at this node on path %s", baseRootDirPath)
-	} else {
-		log.Debugf("Create dir if %s is not already there.", baseRootDirPath)
-		if err := os.MkdirAll(baseRootDirPath, 0755); err != nil {
-			return err
-		}
-		// Establish the shared mount with the TRANSPORT options only. Its
-		// per-volume VFS flags are applied below, per volume, so that whichever
-		// volume happens to mount it first does not fix them for every volume
-		// that follows.
-		effectiveMountFlags := common.NFSRootMountOptions(mountFlags)
-		hasNfsvers := false
-		for _, option := range effectiveMountFlags {
-			if strings.HasPrefix(option, "nfsvers=") || strings.HasPrefix(option, "vers=") {
-				hasNfsvers = true
-				break
-			}
-		}
-		if !hasNfsvers {
-			effectiveMountFlags = append(effectiveMountFlags, "nfsvers=4.2")
-		}
-		mounted := false
-		// Step 1 - If FQDN is provided try to use that to mount the root share
-		if fqdn != "" {
-			fqdnEndpointIP, resolveErr := common.ResolveFQDN(fqdn)
-			if resolveErr != nil {
-				log.Errorf("Unable to resolve FQDN %s for root share mount. %v", fqdn, resolveErr)
-			} else {
-				log.Debugf("Calling mount via nfs v4.2 using FQDN %s resolved to IP %s to mount (/) on %s", fqdn, fqdnEndpointIP, baseRootDirPath)
-				err = common.MountShare(ctx, fqdn+":/", baseRootDirPath, effectiveMountFlags)
-				if err == nil {
-					log.Debugf("Successfully mounted root share using FQDN %s resolved to IP %s", fqdn, fqdnEndpointIP)
-					mounted = true
-				} else {
-					log.Errorf("Unable to mount root share via FQDN %s resolved to IP %s. %v", fqdn, fqdnEndpointIP, err)
-				}
-			}
-		}
-		if !mounted {
-			// Step 2 - Get Anvil IP and try to mount with that IP with 4.2, if it fails we will do a fallback to try to mount with other data portals with 4.2 and fallback to 3 if 4.2 fails.
-			anvilEndpointIP, anvilErr := d.hsclient.GetAnvilPortal()
-			if anvilErr != nil {
-				log.Errorf("Not able to extract anvil endpoint. Err %v", anvilErr)
-			}
-			// Step 3 - Use export ip and path to mount root with 4.2 only.
-			log.Debugf("Calling mount via nfs v4.2 using anvil IP %s to mount (/) on %s", anvilEndpointIP, baseRootDirPath)
-			err = common.MountShare(ctx, anvilEndpointIP+":/", baseRootDirPath, effectiveMountFlags)
-			if err != nil {
-				log.Errorf("Unable to mount root share via 4.2 using anvil IP. %v", err)
-
-				// Step 3 - Use fallback
-				log.Debugf("Call for mount root share with anvil IP and 4.2 FAILED, now will do a fallback try with other data portals, with fallback to 4.2 and v3")
-				err = d.MountShareAtBestDataportal(ctx, "/", baseRootDirPath, common.NFSRootMountOptions(mountFlags), fqdn)
-				if err != nil {
-					log.Errorf("Not able to mount root share to mount point %s. Error %v", baseRootDirPath, err)
-					return err
-				}
-			}
-		}
-		log.Debugf("Successfully mounted base (/) share at best data portal to mount point %s", baseRootDirPath)
-	}
-
-	// Apply THIS volume's VFS flags (noatime, ro, ...) to the shared root mount
-	// before its per-volume bind is created from it. Returning early when the
-	// root was already mounted -- as this function used to -- silently dropped
-	// the mountFlags of every volume after the first, so a StorageClass's
-	// mountOptions took effect only if that volume happened to be the one that
-	// established the node's root mount.
-	//
-	// The flags have to land on the SOURCE, before the bind: remounting the bind
-	// target afterwards does not cross the node plugin's Bidirectional mount
-	// propagation boundary (see RemountBindOptions). Callers serialize the root
-	// mount's whole lifecycle under one lock, so volumes with different flags
-	// cannot interleave here even though the root mount itself is shared.
-	return common.RemountBindOptions(baseRootDirPath, mountFlags)
-}
-
-// waitForPathReady waits until the given path exists and is a directory,
-// or until the context is done (e.g., timeout or cancellation).
-func (d *CSIDriver) WaitForPathReady(ctx context.Context, path string, pollInterval time.Duration) error {
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for path %s to be ready: %v", path, ctx.Err())
-		case <-ticker.C:
-			stat, err := os.Stat(path)
-			if err == nil && stat.IsDir() {
-				return nil // Path is ready
-			}
-
-			// If path does not exist, continue polling
-			if os.IsNotExist(err) {
-				continue
-			}
-
-			// Unexpected error — return immediately
-			if err != nil {
-				return fmt.Errorf("error checking path %s: %v", path, err)
-			}
-		}
-	}
 }
 
 func IsAnyVolumeStillMounted(baseMarkerDir string) bool {

@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
-	"time"
 
 	"context"
 
@@ -20,138 +18,51 @@ import (
 )
 
 // Mount share and attach it
-func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, targetPath string, mountFlags []string, fqdn string) error {
-	// Hold the root mount lock for the whole publish. The bind below takes its
-	// source from the shared root export, so the export must not be unmounted,
-	// remounted, or have its VFS flags changed by another volume between
-	// EnsureRootExportMounted and BindMountDevice -- that is exactly the race
-	// that left published volumes stale and broke kubelet's subPath
-	// preparation with ESTALE.
-	unlock, err := d.acquireRootMountLock(ctx)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	// Step 0 — Ensure root share mount exists for this volume (lazy stage for old volumes)
-	rootShareMounted, _ := common.SafeIsMountPoint(common.BaseBackingShareMountPath)
-	if !rootShareMounted {
-		log.Infof("[LazyStage] Root share not mounted — performing stage for old volume %s", volumeId)
-	}
-
-	// Record this volume against the root mount before relying on it, so an
-	// unstage of some other volume cannot conclude the export is unused. This
-	// is idempotent with the marker NodeStageVolume already wrote.
-	if err := os.MkdirAll(common.BaseVolumeMarkerSourcePath, 0755); err != nil {
-		return status.Errorf(codes.Internal, "create volume marker directory %s: %v", common.BaseVolumeMarkerSourcePath, err)
-	}
-	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeId)
-	if err := os.WriteFile(marker, []byte(""), 0644); err != nil {
-		return status.Errorf(codes.Internal, "write volume marker %s: %v", marker, err)
-	}
-
-	// Mount the root export (a no-op when it is already mounted) and apply THIS
-	// volume's mount flags to it, which must happen before the bind below is
-	// created from it.
-	if err := d.EnsureRootExportMounted(ctx, common.BaseBackingShareMountPath, mountFlags, fqdn); err != nil {
-		return status.Errorf(codes.Internal, "root export mount failed: %v", err)
-	}
-
-	if !rootShareMounted {
-		// Clear old mount because now this will come up with bind mount.
-		// This meant the the publish was not from bind mount, so remove old share mount to clear old direct nfs mount and do bind mount from here.
-		log.Debugf("Strating unmouting for target path %s, due to old style mount from v1.2.7 and earlier", targetPath)
-		if err := common.UnmountFilesystem(ctx, targetPath); err != nil {
-			log.Warnf("Not able to clear the old mount point targetpath (%s) volumeid (%s)", targetPath, volumeId)
-		}
-		log.Infof("[LazyStage] Completed mounting base HS share for volume %s", volumeId)
-	}
-
-	// Step 1 create a targetpath
-	log.Debugf("Check if target path exist. %s", targetPath)
-	if _, err := os.Stat(targetPath); err != nil {
-		log.Debugf("Target path does not exist creating it. %s", targetPath)
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(targetPath, 0755); err != nil {
-				return fmt.Errorf("failed to create target path: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to stat target path: %w", err)
-		}
-	}
-
-	// Step 2 check if this is already a mount point
-	log.Debugf("Target path exist check if it already a mount point")
+func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stagingTarget, targetPath string, mountFlags []string, fqdn string) error {
 	mounted, err := common.SafeIsMountPoint(targetPath)
-	log.Debugf("Checking if target is a already a mount point %s", targetPath)
-	if err != nil {
-		log.Warnf("Error while checking target path is a mount point %s %v", targetPath, err)
-		return status.Error(codes.Internal, err.Error())
-	}
-
-	// Step 3 check is mounted return
-	if mounted {
-		log.Debugf("Volume (%s) already published at %s", volumeId, targetPath)
+	if err == nil && mounted {
+		log.Debugf("Volume (%s) already published at %s; nothing to do", volumeId, targetPath)
 		return nil
 	}
-	// Step 4 if not mounted created a mount point
-
-	// Bind mount from staging to target
-	/** eg: The belwo should be:
-	/usr/bin/mount --bind
-	/mnt/hammerspace_root/share1/
-	/var/lib/kubelet/pods/bbab7dff-b679-4315-9de0-cf1484b4d11d/volumes/kubernetes.io~csi/share1-base-pv/mount.
-
-	* This is the same thing as with "autofs": if you do "/net/foo" as opposed to "/net/foo/" you won't trigger the automounter.
-	This is by design, so that readdir() and "ls -l" won't trigger an automtic automount of everything in the directory.
-	**/
-	sourcePath := filepath.Join(common.BaseBackingShareMountPath, volumeId)
-	if !strings.HasSuffix(sourcePath, "/") {
-		sourcePath += "/"
+	if err != nil && !os.IsNotExist(err) {
+		if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
+			log.Warnf("native NFS target %s is stale; force-detaching before republish", targetPath)
+			if unmountErr := forceUnmountTarget(targetPath); unmountErr != nil {
+				return status.Errorf(codes.Internal, "clean stale NFS target %s: %v", targetPath, unmountErr)
+			}
+		} else {
+			return status.Errorf(codes.Internal, "check NFS target %s: %v", targetPath, err)
+		}
 	}
 
-	// Bounded well inside the root-mount lock's own 30s acquisition timeout, so
-	// a slow submount here cannot make every other Node RPC on this node fail
-	// with Aborted while queued behind this lock.
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	if err := d.WaitForPathReady(ctx, sourcePath, 500*time.Millisecond); err != nil {
-		log.Errorf("Volume path %s not ready: %v", sourcePath, err)
-		return status.Errorf(codes.Internal, "volume path %s not ready: %v", sourcePath, err)
+	if err := os.MkdirAll(targetPath, 0755); err != nil {
+		return status.Errorf(codes.Internal, "create NFS target %s: %v", targetPath, err)
 	}
 
-	// Apply this volume's VFS flags to the BIND SOURCE -- this volume's own
-	// nested NFS submount -- not to the root export.
-	//
-	// EnsureRootExportMounted remounts the root, but MS_REMOUNT is not
-	// recursive and does not reach a submount that already exists underneath
-	// it. Each volume is its own submount, so the flags must be set here, on
-	// the exact mount the bind below is taken from, and only after
-	// WaitForPathReady has triggered that submount into existence.
-	if err := common.RemountBindOptions(sourcePath, mountFlags); err != nil {
-		// Not fatal: the volume is usable, just without its per-volume flags.
-		log.Warnf("could not apply mount options %v to %s: %v", mountFlags, sourcePath, err)
+	if stagingTarget != "" {
+		// The share is mounted once at the CSI staging path. Publishing is a local
+		// bind per pod, while kubelet creates any subPath binds beneath that.
+		//
+		// Refuse to bind a staging path with nothing mounted on it. Binding it
+		// anyway hands the pod an empty directory on the node's own disk: every
+		// write succeeds, nothing reaches Hammerspace, and the data is lost when
+		// the pod moves. Failing here turns that silent data loss into an error
+		// kubelet retries and reports.
+		staged, checkErr := common.SafeIsMountPoint(stagingTarget)
+		if checkErr != nil {
+			return status.Errorf(codes.Internal, "check staged NFS volume %s at %s: %v", volumeId, stagingTarget, checkErr)
+		}
+		if !staged {
+			return status.Errorf(codes.FailedPrecondition, "NFS volume %s is not mounted at staging path %s; refusing to publish an unbacked directory", volumeId, stagingTarget)
+		}
+		if err := common.BindMountDevice(stagingTarget, targetPath); err != nil {
+			return status.Errorf(codes.Internal, "bind staged NFS volume %s to %s: %v", stagingTarget, targetPath, err)
+		}
+		return nil
 	}
 
-	if err := common.BindMountDevice(sourcePath, targetPath); err != nil {
-		log.Errorf("bind mount failed for %s: %v", targetPath, err)
-		return err
-	}
-	log.Debugf("Bind mount is success, from source (%s) to target (%s)", sourcePath, targetPath)
-
-	mounted, err = common.SafeIsMountPoint(targetPath)
-	log.Debugf("Checking mount is point target (%s).", targetPath)
-	if err != nil {
-		log.Warnf("Could not determine mount status of %s: %v", targetPath, err)
-	} else if !mounted {
-		log.Warnf("Bind mount from %s to %s appears to have failed (target is not a mount point)", sourcePath, targetPath)
-	} else {
-		log.Infof("Bind mount completed from %s to %s.", sourcePath, targetPath)
-	}
-
-	return err
-
+	// Controller-side metadata operations do not have a CSI staging path.
+	return d.MountShareAtBestDataportal(ctx, volumeId, targetPath, mountFlags, fqdn)
 }
 
 // Check base pv exist as backingShareName and create path with backingShareName/exportPath attach to target path

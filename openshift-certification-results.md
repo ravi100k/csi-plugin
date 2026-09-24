@@ -1,3 +1,197 @@
+# OpenShift certification results — 2026-09-24
+
+Status: **both profiles are green. NFS 40 pass / 0 fail, block 64 pass / 0 fail.**
+The two file-subPath failures that survived every earlier fix are gone, as is
+the capacity failure. The fix for subPath replaces the node's shared
+root-export mount with one direct NFS mount per volume. Nothing is committed;
+the per-change reasons are in `openshift-certification-code-changes.md`. No
+Partner Connect activity.
+
+## Environment
+
+| | |
+| --- | --- |
+| Cluster | OpenShift 4.22.13 / Kubernetes 1.35.6, single node `00-50-56-ad-47-02` |
+| Backend (NFS run) | Hammerspace Anvil `10.200.109.40`, data portal `10.200.109.43` (NFS_V4_1 and NFS_V3 up) |
+| Backend (block run) | Hammerspace Anvil `10.200.105.164`, three data portals (`10.200.107.170`, `10.200.108.29`, `10.200.107.161`), each NFS_V4_1 and NFS_V3. `.40` became unreachable after the NFS run. |
+| Driver image | NFS: `stagefix-20260924`. Block: `cleanup-20260924` (adds the dead-code removal) |
+| Operator image | `localhost/hammerspace-csi-operator:cap-on-20260922` |
+| Branch | `operator-code` @ `6e5bd24` + uncommitted working tree |
+
+## Results
+
+| Profile | Passed | Failed | Skipped | Duration | Driver image |
+| --- | --- | --- | --- | --- | --- |
+| NFS | **40** | **0** | 252 | 81m | `stagefix-20260924` |
+| Block | **64** | **0** | 226 | ~20m | `cleanup-20260924` |
+
+Against 2026-09-23 (NFS 37/3):
+- **subPath:** all 16 tests pass, including `file as subpath` and `readOnly file
+  specified in the volumeMount`, which failed in every earlier full run.
+- **Capacity:** `capacity provides storage capacity information` passes.
+- **LUN Overflow:** passed in 53m59s against its 60m limit (see below).
+
+The suite exited non-zero only because of **cluster monitor checks, not driver
+tests**:
+
+| Monitor failures | Cause | Driver? |
+| --- | --- | --- |
+| 51 × `kubelet-container-restarts` | One per OpenShift system namespace; the monitor window reaches back to 2026-09-17. `hammerspace-csi` isn't among them and its pods have 0 restarts. | No |
+| 24 × platform checks (`required-scc-annotation`, `termination-message-policy`, `lease-checker`, etcd/node/alerts invariants) | OpenShift's own workloads | No |
+| `image-registry-availability` | The internal registry is removed on this lab cluster | Cluster setup |
+| 2 in `kube-system` | Pod `hscsi-nfsdiag9`, a leftover diagnostic pod from 09-22. Now deleted. | Leftover |
+| Pathological events in the LUN Overflow namespace | `ExternalProvisioning ... Waiting for a volume` repeated up to 84× per PVC while the loaded Anvil created shares at ~4 per minute | Backend throughput |
+
+### Block run notes
+
+- **Same result as before:** block matches its 2026-09-23 result (64/0), now
+  with the staged design and the root-export code removed. The pre-flight gate
+  and the suite show that file-backed and block volumes work with staging
+  reduced to a no-op.
+- **Monitor failures:** 77, the same cluster-wide set as in the NFS run. The
+  only one naming the driver is the "pathological events" check on
+  `statefulset/csi-provisioner`. Its delete/create events have been counted since
+  2026-09-22 and grow by one per driver image rollout; the latest was at 12:21.
+  The driver had 0 container restarts during the run.
+- **Image changed mid-run:** at about 12:21, the operator's
+  `RELATED_IMAGE_DRIVER` was changed to `clean-20260924`, outside this harness.
+  Only the last test, LUN Overflow, was still running then, and it passed.
+  Every other test finished on `cleanup-20260924`.
+- **Before the run:** four NFS mounts to the unreachable `.40` Anvil were left on
+  the node: the legacy root export and three backing shares. They were lazily
+  detached, so the same-named backing share on the new Anvil could not hit a
+  dead mount.
+
+## Moving off the root-export bind design
+
+### The old design
+
+`NodeStageVolume` mounted the Hammerspace root export (`/`) once per node at
+`/var/lib/hammerspace/rootmount`. Each share under it is an NFS junction, which
+the kernel NFS client turns into an automounted submount the first time it is
+traversed. `NodePublishVolume` bind-mounted `rootmount/<share>/` into the pod.
+So a pod's volume was a bind of an automounted submount inside a node-wide
+mount.
+
+### Why file subPaths failed
+
+For a file subPath, kubelet opens the file and then runs
+`mount --bind /proc/<pid>/fd/N <target>`. Under the old design that bind failed
+with `ESTALE` (`failed to prepare subPath for volumeMount`). Directory subPaths,
+which kubelet prepares differently, passed.
+
+What was established:
+- `ESTALE` appeared only when the volume was reached through a root-export
+  junction.
+- It disappeared when the share was mounted directly.
+
+The exact kernel mechanism was not isolated. The main suspect: junction
+submounts are shrinkable automounts
+(`/proc/sys/fs/nfs/nfs_mountpoint_timeout=500`), so the dentry the file
+descriptor points into can be invalidated underneath kubelet.
+
+### What was tried first
+
+Only the full-run results are conclusive. Several changes passed targeted runs
+and then failed in a full run.
+
+| Attempt | Evidence | Result |
+| --- | --- | --- |
+| Root-mount lifecycle lock (serialize stage/unstage/publish on the shared root) | 09-23 full runs | Both file-subPath tests still failed. The lock was independently justified, but it wasn't the cause. |
+| Stop remounting the shared root per volume (your change) | `userfix1.log` | Both failed |
+| Recursive bind (`rbind`) from the root export | `rbind1.log` | Both failed |
+| Make periodic republish (`requiresRepublish: true`) a no-op when already published, so it stops remounting the root under live pods | `republish1.log` | Both failed |
+| `lookupcache=none` / `lookupcache=pos` on the root mount | `lc1`, `lc2`, `lcpos1` targeted | Passed targeted runs |
+| … the same, in a full run | `final-nfs.log` (37/3) | Both file-subPath tests failed again, so it was removed |
+| **Staged design: direct per-volume mount** | `stage1.log`, then targeted `subpathstage-20260924` | **Passed, with 0 `ESTALE`** |
+| … the same, in a full run | `stagefix-full-nfs.log` | **40/0, all 16 subPath tests pass** |
+
+### The new design
+
+| Volume type | Stage | Publish |
+| --- | --- | --- |
+| Native NFS | Mount the share directly at the CSI staging path (`.../globalmount`) | Bind the staging path into the pod; kubelet makes subPath binds beneath it |
+| File-backed ext4/xfs, raw block, NFS inside a backing share | Nothing | Mount the backing share on demand, then attach the backing file through it, as before |
+
+The node no longer mounts the root export at all. For volumes staged by an
+older driver version, `NodeUnstageVolume` still cleans up their markers and the
+root mount.
+
+### Verified on the node with `deploy-test/paypal/pod3.yaml`
+
+This is a pre-provisioned PV for `/share2`, one pod, and 100 subPath mounts
+(`cosmos1/user0..99`). Read from `/proc/1/mountinfo` in the host namespace:
+
+| Role | Count | Kind |
+| --- | --- | --- |
+| Staging `globalmount`, `10.200.109.43:/share2`, type `nfs` | 1 | **Actual NFS mount** |
+| CSI publish into the pod | 1 | Bind of the staging mount |
+| kubelet subPath mounts | 100 | Binds |
+| **Total** | **102** | **1 NFS mount + 101 binds**, all on one superblock (`0:426`) |
+
+- **Write path:** a file written in the pod was read back on the node through the
+  staging NFS mount, and all 100 `userN` directories were present there.
+- **Teardown:** deleting the pod and PV left 0 CSI NFS mounts on the node.
+
+### A data-loss bug found and fixed during the switch
+
+The first staged build ran pod3 with **0 NFS mounts**. Every entry was on
+`8:4` (`/dev/sda4`, the node's local disk), and `share2` stayed empty.
+- **Cause:** the static PV has no `fsType`. Stage didn't recognise it as native
+  NFS and mounted nothing; publish defaulted it to `nfs` and bound the empty
+  staging directory.
+- **Effect:** the pod ran and wrote successfully, all to local disk.
+- **Fix:** stage and publish now share one fsType resolution, and publish refuses
+  to bind a staging path with nothing mounted on it. The table above is the
+  re-run.
+
+### What the new design costs
+
+- **More mounts:** one NFS mount per volume per node instead of one per node.
+  260 volumes on one node (LUN Overflow) worked.
+- **Mounts wait for Anvil publishing:**
+  - **Stage needs a published share.** A share can be staged only after the
+    Anvil has published it (`shareState: PUBLISHED`, visible in
+    `showmount -e`), not just created it (`MOUNTED`, which is when
+    `share-create` completes and the PV binds).
+  - **Behaviour on a loaded Anvil:** that gap exceeded 8 minutes during LUN
+    Overflow. NodeStage failed with `could not mount to any data-portals` and
+    kubelet retried until the share was published.
+  - **LUN Overflow timing:** the test passed in 53m59s. The two passing runs on
+    09-23 took 34 and 36 minutes, but under different Anvil load, so this isn't
+    a like-for-like comparison.
+  - **Decision (2026-09-24):** no driver-side wait or root-export fallback.
+    Kubelet's retries handle it.
+- **Upgrade:** a new pod on a node where the old driver already staged the same
+  volume is refused until that volume is unstaged there. This is untested. See
+  "Known issues" in the code-changes document.
+
+## Anvil throughput observed
+
+- **Share creation:** about 4 per minute on `.40` during LUN Overflow.
+- **Share deletion after the run:** the 260 LUN Overflow shares hit
+  `400 Task 'share-delete' is already running ... VALIDATED/EXECUTING`. The
+  provisioner retries a delete while the first one is still queued on the Anvil.
+  The drain had removed 1 of 260 after about 20 minutes, and `/tasks` did not
+  answer within 60s.
+- **Lesson:** leave the Anvil time to drain between profiles.
+
+## Artifacts
+
+- `/tmp/hscsi-cert-20260923/nfs/stagefix-full-nfs.log`: the green NFS run
+- `/tmp/hscsi-cert-20260923/nfs/results/`: its JUnit XML and HTML summaries
+- `/tmp/hscsi-cert-20260923/nfs/{userfix1,rbind1,republish1,lc1,lc2,lcpos1,stage1}.log`: the targeted attempts in the table above
+- `/tmp/hscsi-cert-20260923/nfs/results-prev-070511/`: the previous NFS results
+
+## Not done
+
+- Upgrade from the root-export design not tested
+- Multi-node behaviour unexercised (single-node cluster)
+- KubeVirt storage checkup not started
+- Nothing committed; no Partner Connect submission
+
+---
+
 # OpenShift certification results — 2026-09-23
 
 Status: **block profile is green — 64 pass / 0 fail.** NFS is at 37 pass / 3 fail,

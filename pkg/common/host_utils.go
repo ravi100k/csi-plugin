@@ -284,57 +284,6 @@ func isBindMountOption(option string) bool {
 	return false
 }
 
-// knownNFSMountOption reports whether a bare-word option (one with no "=") is a
-// recognized NFS transport option. Options of the form key=value are always
-// transport options, so they never reach this.
-func knownNFSMountOption(option string) bool {
-	switch option {
-	case "hard", "soft", "softerr", "ac", "noac", "bg", "fg", "intr", "nointr",
-		"lock", "nolock", "cto", "nocto", "resvport", "noresvport",
-		"sharecache", "nosharecache", "tcp", "udp", "rdma", "posix",
-		"acl", "noacl", "rdirplus", "nordirplus", "migration", "nomigration",
-		"local_lock", "nconnect", "fatal_neterrors", "trunkdiscovery", "notrunkdiscovery":
-		return true
-	}
-	return false
-}
-
-// unknownMountOption reports a bare-word mount option that is neither a known
-// per-mount VFS flag nor a known NFS transport option. Such an option is
-// assumed to be a transport option and lands on the shared mount; if it is
-// really a VFS flag the kernel has since gained, that silently reintroduces the
-// cross-volume flag leak isBindMountOption exists to prevent. Callers log it so
-// the gap surfaces in driver logs rather than as mysterious mount behaviour.
-func unknownMountOption(option string) bool {
-	if option == "" || strings.Contains(option, "=") {
-		return false
-	}
-	return !isBindMountOption(option) && !knownNFSMountOption(option)
-}
-
-// NFSRootMountOptions strips the per-volume VFS flags from a volume's mount
-// options, leaving the NFS transport options that the shared root/backing mount
-// can legitimately be established with. The stripped flags are applied
-// per-volume by RemountBindOptions instead, so the first volume to trigger the
-// shared mount cannot impose its own flags on every volume that follows.
-func NFSRootMountOptions(flags []string) []string {
-	var options []string
-	for _, flag := range flags {
-		for _, option := range strings.Split(flag, ",") {
-			if isBindMountOption(option) {
-				continue
-			}
-			if unknownMountOption(option) {
-				log.Warnf("mount option %q is not a recognized NFS transport option or per-mount VFS flag; "+
-					"treating it as a transport option, so it will apply to the SHARED mount rather than to this volume alone. "+
-					"If it is a per-mount flag, add it to isBindMountOption.", option)
-			}
-			options = append(options, option)
-		}
-	}
-	return options
-}
-
 // RemountBindOptions sets the VFS flags on an existing mount in this namespace.
 //
 // It must be applied to the SOURCE of a bind, before the bind is created.

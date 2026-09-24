@@ -306,21 +306,6 @@ func TestExpandRawFileSizeTouchesOnlyTheFile(t *testing.T) {
 	}
 }
 
-// A volume's per-mount VFS flags must not be baked into the shared NFS mount
-// (where the first volume would impose them on every later one); they are
-// applied per volume by RemountBindOptions instead. Transport options must
-// survive, or the shared mount is established wrongly.
-func TestNFSRootMountOptionsKeepsOnlyTransportOptions(t *testing.T) {
-	got := NFSRootMountOptions([]string{"noatime", "nfsvers=4.2,hard", "ro", "timeo=600"})
-	expected := []string{"nfsvers=4.2", "hard", "timeo=600"}
-	if !reflect.DeepEqual(got, expected) {
-		t.Fatalf("expected %v, got %v", expected, got)
-	}
-	if NFSRootMountOptions(nil) != nil {
-		t.Fatal("expected no options for no flags")
-	}
-}
-
 func TestRemountBindOptionsAppliesOnlyVFSFlags(t *testing.T) {
 	orig := ExecCommand
 	defer func() { ExecCommand = orig }()
@@ -360,21 +345,6 @@ func TestIsBindMountOptionCoversKernelPerMountFlags(t *testing.T) {
 	for _, o := range notPerMount {
 		if isBindMountOption(o) {
 			t.Errorf("%q is not a per-mount flag but is classified as one; a bind remount would fail on it", o)
-		}
-	}
-}
-
-// An option we recognize as neither kind is the silent-failure case, so it must
-// be flagged. Known options of both kinds must not be.
-func TestUnknownMountOptionDetection(t *testing.T) {
-	for _, o := range []string{"noatime", "ro", "hard", "nolock", "vers=4.1", "timeo=600", ""} {
-		if unknownMountOption(o) {
-			t.Errorf("%q is recognized and should not be reported as unknown", o)
-		}
-	}
-	for _, o := range []string{"nofuturekernelflag", "somethingelse"} {
-		if !unknownMountOption(o) {
-			t.Errorf("%q is unrecognized and must be reported, or a future per-mount flag leaks silently", o)
 		}
 	}
 }

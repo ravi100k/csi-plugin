@@ -656,3 +656,34 @@ func TestFileSnapshotTimestamp(t *testing.T) {
 		})
 	}
 }
+
+// GetClusterAvailableCapacity must always query the Anvil and refresh
+// FREE_CAPACITY as a side effect. Callers that want the cached figure read it
+// themselves (CreateVolume, GetCapacity), so caching inside here would break
+// the callers that need a current value.
+func TestGetClusterAvailableCapacityAlwaysQueriesAndRefreshesCache(t *testing.T) {
+	setupHTTP()
+	defer tearDownHTTP()
+
+	calls := 0
+	Mux.HandleFunc(BasePath+"/cntl/state", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, `{"capacity":{"free":8192}}`)
+	})
+
+	for i := 0; i < 2; i++ {
+		got, err := hsclient.GetClusterAvailableCapacity(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != 8192 {
+			t.Fatalf("capacity = %d, want 8192", got)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("Anvil queried %d times; this call must not serve from cache", calls)
+	}
+	if cached, _ := common.GetCacheData("FREE_CAPACITY"); cached != int64(8192) {
+		t.Fatalf("FREE_CAPACITY = %v, want the value to be refreshed to 8192", cached)
+	}
+}

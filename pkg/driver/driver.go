@@ -141,27 +141,16 @@ func (c *CSIDriver) acquireVolumeLock(ctx context.Context, volID string) (func()
 	return func() { lk.unlock(); release() }, nil
 }
 
-// acquireRootMountLock serializes the lifecycle of the node-wide root NFS
-// export at common.BaseBackingShareMountPath.
-//
-// That single mount is shared by every share-backed volume on the node, each
-// volume's data is a nested NFS submount inside it, and NodeUnstageVolume
-// unmounts it as soon as the last volume is unstaged. Without this lock, an
-// unstage could tear it down and the next stage rebuild it while another
-// volume was already published off it -- which invalidated that volume's bind
-// and made kubelet's subPath preparation fail with ESTALE, reproduced by
-// correlating two root remounts ten seconds apart against the certification
-// suite's subPath failures.
+// acquireRootMountLock serializes cleanup of the node-wide root NFS export at
+// common.BaseBackingShareMountPath, which driver versions before the
+// staged-NFS design mounted at stage time. NodeUnstageVolume holds it while it
+// drops an old volume's marker and unmounts the export after the last one, so
+// two concurrent unstages cannot both miscount the remaining markers.
 //
 // It reuses the volume lock map, keyed by the mount path. That key cannot
 // collide with a CSI volume ID, which is always a Hammerspace share or file
-// path.
-//
-// This is deliberately exclusive rather than shared-for-readers: a publish
-// holds it for the duration of its bind, so concurrent stages and publishes on
-// a node serialize behind each other. The lock carries the same 30s timeout as
-// every other lock here, so contention surfaces to kubelet as a retryable
-// Aborted instead of a hang.
+// path. The lock carries the same 30s timeout as every other lock here, so
+// contention surfaces to kubelet as a retryable Aborted instead of a hang.
 func (c *CSIDriver) acquireRootMountLock(ctx context.Context) (func(), error) {
 	return c.acquireVolumeLock(ctx, common.BaseBackingShareMountPath)
 }
