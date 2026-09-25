@@ -226,21 +226,28 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 	}
 	fsType := nodeVolumeFsType(volumeCapability, volumeContext)
 
-	// A native share-backed NFS volume is staged as one direct NFS mount per
-	// volume per node. NodePublishVolume binds this mount into each pod. This is
-	// the standard CSI topology and avoids both one NFS mount per pod and the
-	// Hammerspace root-export junction that returns ESTALE for file subPaths.
-	if fsType == "nfs" && volumeContext["mountBackingShareName"] == "" {
-		if err := d.MountShareAtBestDataportal(ctx, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
+	// An NFS volume is staged as one direct NFS mount per volume per node, with
+	// the volume's own mount options. NodePublishVolume binds this mount into
+	// each pod. This is the standard CSI topology and avoids both one NFS mount
+	// per pod and the Hammerspace root-export junction that returns ESTALE for
+	// file subPaths. A nested NFS volume (a directory inside a backing share)
+	// gets its own mount of that directory, not a bind out of the node's shared
+	// backing-share mount.
+	if fsType == "nfs" {
+		if backingShareName := volumeContext["mountBackingShareName"]; backingShareName != "" {
+			if err := d.stageNestedNFSVolume(ctx, backingShareName, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
+				return nil, err
+			}
+		} else if err := d.MountShareAtBestDataportal(ctx, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
 			return nil, err
 		}
-		log.Infof("Staged native NFS share %s at %s", volumeID, stagingTarget)
+		log.Infof("Staged NFS volume %s at %s", volumeID, stagingTarget)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	// File-backed, block, and NFS-in-backing-share volumes have nothing to stage:
-	// NodePublishVolume mounts their backing share (EnsureBackingShareMounted)
-	// and reaches the backing file through it.
+	// File-backed and block volumes have nothing to stage: NodePublishVolume
+	// mounts their backing share (EnsureBackingShareMounted) and reaches the
+	// backing file through it.
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -359,24 +366,15 @@ func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 		return nil, status.Errorf(codes.InvalidArgument, common.NoCapabilitiesSupplied, volume_id)
 	}
 
-	// For NFS
-	if fsType == "nfs" && backingShareName == "" {
+	// Native and nested NFS volumes are both staged as their own NFS mount, so
+	// both publish the same way.
+	if fsType == "nfs" {
 		log.WithFields(log.Fields{
 			"NFS Backing share": backingShareName,
 			"Volume_id":         volume_id,
 			"Traget Path":       targetPath,
-		}).Info("Starting node publish volume for Share backed NFS volume without backing share.")
-		err := d.publishShareBackedVolume(ctx, volume_id, req.GetStagingTargetPath(), targetPath, mountFlags, volumeContext["fqdn"])
-		if err != nil {
-			return nil, err
-		}
-	} else if fsType == "nfs" && backingShareName != "" {
-		log.WithFields(log.Fields{
-			"NFS Backing share": backingShareName,
-			"Volume_id":         volume_id,
-			"Traget Path":       targetPath,
-		}).Info("Starting node publish volume for Share backed NFS volume with backing share.")
-		err := d.publishShareBackedDirBasedVolume(ctx, backingShareName, volume_id, targetPath, fsType, mountFlags, volumeContext["fqdn"])
+		}).Info("Starting node publish volume for NFS volume.")
+		err := d.publishShareBackedVolume(ctx, volume_id, req.GetStagingTargetPath(), targetPath, mountFlags, readOnly, volumeContext["fqdn"])
 		if err != nil {
 			return nil, err
 		}

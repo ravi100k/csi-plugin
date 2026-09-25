@@ -218,33 +218,6 @@ func ExpandFilesystem(device, fsType string) error {
 	return nil
 }
 
-// isBindMountOption reports whether a mount option is a per-mount VFS flag --
-// one the kernel stores on the mount itself rather than on the NFS superblock,
-// and therefore one a bind mount can carry independently of its source.
-//
-// This list is not arbitrary: it is exactly the set of options that map to the
-// kernel's PER-MOUNT MS_* flags, the only ones "mount -o remount,bind" can
-// change. It mirrors, one line per flag:
-//
-//	MS_RDONLY      ro / rw
-//	MS_NOSUID      nosuid / suid
-//	MS_NODEV       nodev / dev
-//	MS_NOEXEC      noexec / exec
-//	MS_NOATIME     noatime / atime
-//	MS_NODIRATIME  nodiratime / diratime
-//	MS_RELATIME    relatime / norelatime
-//	MS_STRICTATIME strictatime
-//	MS_NOSYMFOLLOW nosymfollow / symfollow   (Linux 5.10+)
-//
-// Superblock options (lazytime, sync, dirsync, mand) are deliberately absent:
-// they cannot be changed by a bind remount, and passing one to that remount
-// makes it fail. NFS transport options (vers, hard, timeo, rsize, proto) are
-// absent for the same reason -- they belong to the shared mount.
-//
-// If the kernel gains a new per-mount flag, add it here. Until then an
-// unrecognized flag is treated as a transport option, which means it ends up on
-// the SHARED mount where the first volume to use it imposes it on every volume
-// after -- silently. unknownMountOption exists to make that visible instead.
 // ExpandMountedFilesystem grows the filesystem of an already-mounted volume,
 // handing each resize tool the target it actually accepts.
 //
@@ -268,23 +241,7 @@ func ExpandMountedFilesystem(targetPath, backingFile, fsType string) error {
 	return ExpandFilesystem(loopdev, fsType)
 }
 
-func isBindMountOption(option string) bool {
-	switch option {
-	case "ro", "rw",
-		"nosuid", "suid",
-		"nodev", "dev",
-		"noexec", "exec",
-		"noatime", "atime",
-		"nodiratime", "diratime",
-		"relatime", "norelatime",
-		"strictatime",
-		"nosymfollow", "symfollow":
-		return true
-	}
-	return false
-}
-
-// RemountBindOptions sets the VFS flags on an existing mount in this namespace.
+// RemountBindReadOnly makes an existing bind mount in this namespace read-only.
 //
 // It must be applied to the SOURCE of a bind, before the bind is created.
 // Remounting the bind TARGET afterwards cannot work across the container/host
@@ -292,19 +249,11 @@ func isBindMountOption(option string) bool {
 // propagation sets up: that boundary propagates mount and unmount topology
 // events, not flag-only remounts of an already-propagated mount. A bind created
 // after this remount is itself a new topology event, so it carries the source's
-// current flags with it.
-func RemountBindOptions(target string, flags []string) error {
-	opts := []string{"remount", "bind", "rw", "relatime", "diratime"}
-	for _, flag := range flags {
-		for _, option := range strings.Split(flag, ",") {
-			if isBindMountOption(option) {
-				opts = append(opts, option)
-			}
-		}
-	}
-	output, err := ExecCommand("mount", "-o", strings.Join(opts, ","), target)
+// read-only flag with it.
+func RemountBindReadOnly(target string) error {
+	output, err := ExecCommand("mount", "-o", "remount,bind,ro", target)
 	if err != nil {
-		log.Errorf("could not remount %s with options %v: %s: %v", target, opts, output, err)
+		log.Errorf("could not remount %s read-only: %s: %v", target, output, err)
 	}
 	return err
 }

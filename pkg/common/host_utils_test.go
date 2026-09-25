@@ -306,7 +306,7 @@ func TestExpandRawFileSizeTouchesOnlyTheFile(t *testing.T) {
 	}
 }
 
-func TestRemountBindOptionsAppliesOnlyVFSFlags(t *testing.T) {
+func TestRemountBindReadOnly(t *testing.T) {
 	orig := ExecCommand
 	defer func() { ExecCommand = orig }()
 
@@ -316,36 +316,12 @@ func TestRemountBindOptionsAppliesOnlyVFSFlags(t *testing.T) {
 		return []byte(""), nil
 	}
 
-	if err := RemountBindOptions("/var/lib/hammerspace/rootmount", []string{"noatime", "nfsvers=4.2,nodev"}); err != nil {
+	if err := RemountBindReadOnly("/tmp/.hscsi-bind-1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expected := []string{"mount", "-o", "remount,bind,rw,relatime,diratime,noatime,nodev", "/var/lib/hammerspace/rootmount"}
+	expected := []string{"mount", "-o", "remount,bind,ro", "/tmp/.hscsi-bind-1"}
 	if !reflect.DeepEqual(got, expected) {
 		t.Fatalf("expected %v, got %v", expected, got)
-	}
-}
-
-// The per-mount flag list must cover every option the kernel lets a bind
-// remount change, and must exclude superblock and NFS transport options, which
-// a bind remount cannot change and which belong to the shared mount.
-func TestIsBindMountOptionCoversKernelPerMountFlags(t *testing.T) {
-	perMount := []string{
-		"ro", "rw", "nosuid", "suid", "nodev", "dev", "noexec", "exec",
-		"noatime", "atime", "nodiratime", "diratime",
-		"relatime", "norelatime", "strictatime", "nosymfollow", "symfollow",
-	}
-	for _, o := range perMount {
-		if !isBindMountOption(o) {
-			t.Errorf("%q is a per-mount kernel flag but is not classified as one, so it would leak onto the shared mount", o)
-		}
-	}
-	// Superblock options and NFS transport options must never be applied to a
-	// bind remount -- the kernel rejects them.
-	notPerMount := []string{"lazytime", "sync", "dirsync", "mand", "hard", "vers=4.1", "timeo=600", "nfsvers=4.2"}
-	for _, o := range notPerMount {
-		if isBindMountOption(o) {
-			t.Errorf("%q is not a per-mount flag but is classified as one; a bind remount would fail on it", o)
-		}
 	}
 }
 

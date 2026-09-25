@@ -248,9 +248,15 @@ func (d *CSIDriver) ensureNFSDirectoryExists(ctx context.Context, backingShareNa
 	targetPath := common.ShareStagingDir + backingShare.ExportPath
 	deviceFile := targetPath + "/" + hsVolume.Name
 
-	// mount the share to create the directory
+	// Mount the share to create the directory. The mount is shared with every
+	// file-backed and block volume on this share, so it must not carry this
+	// volume's own mount options: a StorageClass "ro" here would make the whole
+	// backing share read-only. The volume's options apply to its own mount at
+	// stage time instead.
+	shareMountVolume := *hsVolume
+	shareMountVolume.MountFlags = nil
 	defer d.UnmountBackingShareIfUnused(ctx, backingShare.Name)
-	err = d.EnsureBackingShareMounted(ctx, backingShare.Name, hsVolume) // check if share is mounted
+	err = d.EnsureBackingShareMounted(ctx, backingShare.Name, &shareMountVolume) // check if share is mounted
 	if err != nil {
 		log.Errorf("failed to ensure backing share is mounted, %v", err)
 		return err
@@ -353,7 +359,7 @@ func (d *CSIDriver) ensureShareBackedVolumeExists(ctx context.Context, hsVolume 
 	defer common.UnmountFilesystem(ctx, targetPath)
 
 	log.Debugf("Created empty folder with path %s", targetPath)
-	err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, hsVolume.FQDN)
+	err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, hsVolume.FQDN)
 	if err != nil {
 		log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 	} else {
@@ -410,7 +416,7 @@ func (d *CSIDriver) ensureBackingShareExists(ctx context.Context, backingShareNa
 		// generate unique target path on host for setting file metadata
 		targetPath := common.ShareStagingDir + "/metadata-mounts" + hsVolume.Path
 		defer common.UnmountFilesystem(ctx, targetPath)
-		err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, hsVolume.FQDN)
+		err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, hsVolume.FQDN)
 		if err != nil {
 			log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 		}

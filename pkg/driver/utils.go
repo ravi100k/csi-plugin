@@ -319,7 +319,7 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 		switch state {
 		case mountHealthy:
 			log.Infof("backing share already mounted, %s", backingDir)
-			return d.applyBackingShareMountFlags(backingDir, hsVol)
+			return nil
 		case mountStale:
 			// A hung/stale NFS mount is lingering (server unreachable). Force-clear
 			// it best-effort so the mount below re-establishes against the CURRENT
@@ -330,31 +330,19 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 		case mountAbsent:
 			// nothing mounted here; fall through to mount
 		}
+		// This mount is shared by every file-backed and block volume on the share,
+		// whose StorageClass mountOptions are, by design, the backing share's NFS
+		// options. Nested NFS volumes never publish from it: they get their own
+		// mount (stageNestedNFSVolume), and creating their directory mounts this
+		// share with no volume options (ensureNFSDirectoryExists).
 		if err := d.MountShareAtBestDataportal(ctx, backingShare.ExportPath, backingDir, hsVol.MountFlags, hsVol.FQDN); err != nil {
 			log.Errorf("failed to mount backing share, %v", err)
 			return err
 		}
 		log.Infof("mounted backing share, %s", backingDir)
-		return d.applyBackingShareMountFlags(backingDir, hsVol)
-	}
-	return nil
-}
-
-// applyBackingShareMountFlags bakes a volume's per-volume VFS flags into the
-// shared backing mount, for the one volume type that is published by binding
-// straight off it: a nested NFS volume (fsType "nfs") inside a backing share.
-// The flags must be on the bind source before the bind is made, because a
-// flag-only remount of the bind target does not propagate out of the node
-// plugin's mount namespace (see RemountBindOptions).
-//
-// File-backed and block volumes share this mount only to reach their backing
-// file. Their own flags belong on the filesystem or loop device they publish,
-// not on the NFS mount underneath it, so they are left alone here.
-func (d *CSIDriver) applyBackingShareMountFlags(backingDir string, hsVol *common.HSVolume) error {
-	if hsVol.FSType != "nfs" {
 		return nil
 	}
-	return common.RemountBindOptions(backingDir, hsVol.MountFlags)
+	return nil
 }
 
 // mountLockFor returns the per-backing-directory lock that serializes the actual
@@ -546,10 +534,19 @@ func (d *CSIDriver) UnmountBackingShareIfUnused(ctx context.Context, backingShar
 // 3. If all above check is null of err use anvil IP.
 
 func (d *CSIDriver) MountShareAtBestDataportal(ctx context.Context, shareExportPath, targetPath string, mountFlags []string, fqdn string) error {
+	return d.mountShareSubPathAtBestDataportal(ctx, shareExportPath, "", targetPath, mountFlags, fqdn)
+}
+
+// mountShareSubPathAtBestDataportal mounts subPath, a directory inside the share
+// exported at shareExportPath, rather than the share's root. The portal is
+// selected by matching shareExportPath against its export list, since a
+// directory inside a share is not an export of its own; NFSv3 and v4.1 both
+// mount it directly. An empty subPath mounts the whole share.
+func (d *CSIDriver) mountShareSubPathAtBestDataportal(ctx context.Context, shareExportPath, subPath, targetPath string, mountFlags []string, fqdn string) error {
 	var err error
 	var fipaddr string = ""
 
-	log.Debugf("Finding best host exporting %s", shareExportPath)
+	log.Debugf("Finding best host exporting %s (mounting %q inside it)", shareExportPath, subPath)
 
 	portals, err := d.hsclient.GetDataPortals(ctx, d.NodeID)
 	if err != nil {
@@ -607,7 +604,7 @@ func (d *CSIDriver) MountShareAtBestDataportal(ctx context.Context, shareExportP
 		export := ""
 		// Use configured prefix if specified
 		if common.DataPortalMountPrefix != "" {
-			export = fmt.Sprintf("%s:%s%s", addr, common.DataPortalMountPrefix, shareExportPath)
+			export = fmt.Sprintf("%s:%s%s%s", addr, common.DataPortalMountPrefix, shareExportPath, subPath)
 		} else {
 			// grab exports with showmount
 			exports, err := common.GetNFSExports(addr)
@@ -623,7 +620,7 @@ func (d *CSIDriver) MountShareAtBestDataportal(ctx context.Context, shareExportP
 			for _, mountPrefix := range common.DefaultDataPortalMountPrefixes {
 				for _, e := range exports {
 					if e == fmt.Sprintf("%s%s", mountPrefix, shareExportPath) {
-						export = fmt.Sprintf("%s:%s%s", addr, mountPrefix, shareExportPath)
+						export = fmt.Sprintf("%s:%s%s%s", addr, mountPrefix, shareExportPath, subPath)
 						log.Debugf("Found export %s", export)
 						break
 					}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"context"
@@ -17,8 +18,117 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Mount share and attach it
-func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stagingTarget, targetPath string, mountFlags []string, fqdn string) error {
+// Mount operations are variables so the private-bind sequence can be tested
+// without requiring CAP_SYS_ADMIN.
+var (
+	bindMountDevice     = common.BindMountDevice
+	remountBindReadOnly = common.RemountBindReadOnly
+	unmountFilesystem   = common.UnmountFilesystem
+)
+
+// bindMountReadOnly binds source to target read-only without changing the
+// mount that contains source, which a staged volume shares with every other pod
+// publishing it.
+//
+// The read-only flag is set on a private bind that then becomes the source of
+// the final bind, because a flag-only remount of an already propagated pod
+// target does not cross the container/host mount-namespace boundary. The final
+// bind is a new topology event and carries the private source's flags with it.
+func bindMountReadOnly(ctx context.Context, source, target string) error {
+	private, err := os.MkdirTemp(common.ShareStagingDir, ".hscsi-bind-")
+	if err != nil {
+		return fmt.Errorf("create private bind mount: %w", err)
+	}
+	privateMounted := false
+	defer func() {
+		if privateMounted {
+			if cleanupErr := unmountFilesystem(ctx, private); cleanupErr != nil {
+				log.Errorf("failed to clean private bind mount %s: %v", private, cleanupErr)
+			}
+		}
+		if removeErr := os.Remove(private); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Errorf("failed to remove private bind directory %s: %v", private, removeErr)
+		}
+	}()
+
+	if err := bindMountDevice(source, private); err != nil {
+		return fmt.Errorf("create private bind from %s: %w", source, err)
+	}
+	privateMounted = true
+	if err := remountBindReadOnly(private); err != nil {
+		return fmt.Errorf("make private bind read-only: %w", err)
+	}
+	if err := bindMountDevice(private, target); err != nil {
+		return err
+	}
+	if err := unmountFilesystem(ctx, private); err != nil {
+		// Do not report a successful publish while leaking a propagated helper
+		// mount. Roll back the final bind so kubelet can retry the whole sequence.
+		if rollbackErr := unmountFilesystem(ctx, target); rollbackErr != nil {
+			return fmt.Errorf("clean private bind mount: %v (rollback target failed: %v)", err, rollbackErr)
+		}
+		return fmt.Errorf("clean private bind mount: %w", err)
+	}
+	privateMounted = false
+	return nil
+}
+
+// nestedNFSSubPath returns where a nested NFS volume lives inside its backing
+// share. CreateVolume names such a volume "<backing share export path>/<name>",
+// a plain directory inside the share rather than an export of its own.
+func nestedNFSSubPath(volumeID, backingExportPath string) (string, error) {
+	subPath := strings.TrimPrefix(volumeID, backingExportPath)
+	if subPath == volumeID || !strings.HasPrefix(subPath, "/") || len(subPath) < 2 {
+		return "", fmt.Errorf("volume %s is not a directory inside backing share %s", volumeID, backingExportPath)
+	}
+	return subPath, nil
+}
+
+// stageNestedNFSVolume mounts a nested NFS volume's own directory at the CSI
+// staging path, with the volume's mount options, exactly as a native NFS volume
+// is staged. It deliberately does not bind out of the node's shared backing
+// share mount: per-volume options there would apply to every file-backed and
+// block volume on the share.
+func (d *CSIDriver) stageNestedNFSVolume(ctx context.Context, backingShareName, volumeID, stagingTarget string, mountFlags []string, fqdn string) error {
+	backingShare, err := d.hsclient.GetShare(ctx, backingShareName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "look up backing share %s: %v", backingShareName, err)
+	}
+	if backingShare == nil {
+		return status.Errorf(codes.NotFound, "backing share %s not found", backingShareName)
+	}
+	subPath, err := nestedNFSSubPath(volumeID, backingShare.ExportPath)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return d.mountShareSubPathAtBestDataportal(ctx, backingShare.ExportPath, subPath, stagingTarget, nestedNFSMountFlags(mountFlags), fqdn)
+}
+
+// nestedNFSMountFlags adds nosharecache to a nested NFS volume's mount options.
+//
+// By default the kernel NFS client gives every mount of the same export the
+// same superblock, so a nested volume's staging mount would share one with the
+// backing share's own mount and with every other nested volume on that share.
+// mountinfo then shows them all with the same device and root, which kubelet's
+// GetDeviceMountRefs check reads as other references to the staging path: it
+// refuses to unstage the volume for as long as any of them stays mounted.
+// nosharecache gives each nested volume a superblock of its own.
+func nestedNFSMountFlags(mountFlags []string) []string {
+	flags := append([]string{}, mountFlags...)
+	for _, flag := range flags {
+		for _, option := range strings.Split(flag, ",") {
+			if option == "nosharecache" || option == "sharecache" {
+				return flags
+			}
+		}
+	}
+	return append(flags, "nosharecache")
+}
+
+// publishShareBackedVolume publishes a native or nested NFS volume. With a
+// staging path it binds the volume's staged mount into the pod, read-only when
+// the publish asks for it.
+func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stagingTarget, targetPath string, mountFlags []string, readOnly bool, fqdn string) error {
 	mounted, err := common.SafeIsMountPoint(targetPath)
 	if err == nil && mounted {
 		log.Debugf("Volume (%s) already published at %s; nothing to do", volumeId, targetPath)
@@ -55,79 +165,21 @@ func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stag
 		if !staged {
 			return status.Errorf(codes.FailedPrecondition, "NFS volume %s is not mounted at staging path %s; refusing to publish an unbacked directory", volumeId, stagingTarget)
 		}
-		if err := common.BindMountDevice(stagingTarget, targetPath); err != nil {
+		bind := func() error { return bindMountDevice(stagingTarget, targetPath) }
+		if readOnly {
+			bind = func() error { return bindMountReadOnly(ctx, stagingTarget, targetPath) }
+		}
+		if err := bind(); err != nil {
 			return status.Errorf(codes.Internal, "bind staged NFS volume %s to %s: %v", stagingTarget, targetPath, err)
 		}
 		return nil
 	}
 
 	// Controller-side metadata operations do not have a CSI staging path.
+	if readOnly {
+		mountFlags = append(append([]string{}, mountFlags...), "ro")
+	}
 	return d.MountShareAtBestDataportal(ctx, volumeId, targetPath, mountFlags, fqdn)
-}
-
-// Check base pv exist as backingShareName and create path with backingShareName/exportPath attach to target path
-func (d *CSIDriver) publishShareBackedDirBasedVolume(ctx context.Context, backingShareName, exportPath, targetPath, fsType string, mountFlags []string, fqdn string) error {
-	log.Debugf("Recived publish dir based volume request.")
-	unlock, err := d.acquireVolumeLock(ctx, backingShareName)
-	if err != nil {
-		// surfaces to kubelet instead of hanging forever
-		return err
-	}
-	defer unlock()
-
-	mounted, err := common.SafeIsMountPoint(targetPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(targetPath, 0755); err != nil {
-				return status.Error(codes.Internal, err.Error())
-			}
-			mounted = false
-		} else {
-			// Any other error (e.g. permission denied)
-			return status.Error(codes.Internal, err.Error())
-		}
-	}
-
-	if mounted {
-		log.Debugf("Volume already published at %s", targetPath)
-		return nil
-	}
-
-	hsVolume := &common.HSVolume{
-		FQDN:       fqdn,
-		FSType:     fsType,
-		MountFlags: mountFlags,
-	}
-	log.Infof("check nfs backed volume %v", hsVolume)
-
-	// Ensure the backing share is mounted
-	if err := d.EnsureBackingShareMounted(ctx, backingShareName, hsVolume); err != nil {
-		return err
-	}
-
-	// Mount the file
-	log.Infof("Mounting NFS-backed volume at %s", targetPath)
-
-	// Compute full source path inside mounted backing share
-	sourceMountPoint := filepath.Join(common.ShareStagingDir, exportPath)
-
-	// Validate that the source exists
-	if _, err := os.Stat(sourceMountPoint); err != nil {
-		if os.IsNotExist(err) {
-			return status.Errorf(codes.NotFound, "export path %s does not exist inside share %s", exportPath, backingShareName)
-		}
-		return status.Errorf(codes.Internal, "error accessing source path %s: %v", sourceMountPoint, err)
-	}
-
-	if err := common.BindMountDevice(sourceMountPoint, targetPath); err != nil {
-		log.Errorf("bind mount failed for %s: %v", targetPath, err)
-		CleanupLoopDevice(ctx, targetPath)
-		d.UnmountBackingShareIfUnused(ctx, backingShareName)
-		return err
-	}
-
-	log.Infof("Successfully mounted %s -> %s", sourceMountPoint, targetPath)
-	return nil
 }
 
 func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareName, volumePath, targetPath, fsType string, mountFlags []string, readOnly bool, fqdn string) error {
