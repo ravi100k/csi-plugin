@@ -184,7 +184,8 @@
             {
               "args": [
                 "--csi-address=$(CSI_ENDPOINT)",
-                "--health-port=9808"
+                "--health-port=9808",
+                "--probe-timeout=10s"
               ],
               "env": [
                 {
@@ -282,7 +283,7 @@
                 },
                 "initialDelaySeconds": 10,
                 "periodSeconds": 60,
-                "timeoutSeconds": 3
+                "timeoutSeconds": 15
               },
               "name": "hs-csi-plugin-controller",
               "ports": [
@@ -696,7 +697,8 @@
             {
               "args": [
                 "--csi-address=$(CSI_ENDPOINT)",
-                "--health-port=9809"
+                "--health-port=9809",
+                "--probe-timeout=10s"
               ],
               "env": [
                 {
@@ -802,7 +804,7 @@
                 },
                 "initialDelaySeconds": 10,
                 "periodSeconds": 60,
-                "timeoutSeconds": 3
+                "timeoutSeconds": 15
               },
               "name": "hs-csi-plugin-node",
               "ports": [

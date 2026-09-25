@@ -147,6 +147,11 @@ spec:
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--health-port=9808"
+            # The driver's Probe logs in to the Anvil, which can take several
+            # seconds when the Anvil is busy. The 1s default then fails healthy
+            # probes and gets the driver restarted in a loop, interrupting
+            # in-flight mounts. A failed login still fails the probe at once.
+            - "--probe-timeout=10s"
           env:
             - name: CSI_ENDPOINT
               value: /var/lib/csi/hs-csi.sock
@@ -178,7 +183,9 @@ spec:
               path: /healthz
               port: healthz
             initialDelaySeconds: 10
-            timeoutSeconds: 3
+            # Longer than the sidecar's --probe-timeout, so kubelet waits for the
+            # sidecar's answer instead of timing it out first.
+            timeoutSeconds: 15
             periodSeconds: 60
           envFrom:
             - configMapRef:
@@ -382,6 +389,11 @@ spec:
           args:
             - "--csi-address=$(CSI_ENDPOINT)"
             - "--health-port=9809"
+            # The driver's Probe logs in to the Anvil, which can take several
+            # seconds when the Anvil is busy. The 1s default then fails healthy
+            # probes and gets the driver restarted in a loop, interrupting
+            # in-flight mounts. A failed login still fails the probe at once.
+            - "--probe-timeout=10s"
           env:
             - name: CSI_ENDPOINT
               value: /csi/csi.sock
@@ -413,7 +425,9 @@ spec:
               path: /healthz
               port: healthz
             initialDelaySeconds: 10
-            timeoutSeconds: 3
+            # Longer than the sidecar's --probe-timeout, so kubelet waits for the
+            # sidecar's answer instead of timing it out first.
+            timeoutSeconds: 15
             periodSeconds: 60
           envFrom:
             - configMapRef:
