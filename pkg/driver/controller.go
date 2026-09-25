@@ -1137,9 +1137,16 @@ func (d *CSIDriver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeReque
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%s", err.Error())
 	}
-	if share == nil { // legacy/single-segment ID with no share: treat as file-backed
-		err = d.deleteFileBackedVolume(ctx, volumeId)
-		return &csi.DeleteVolumeResponse{}, err
+	if share == nil {
+		// A single-segment ID always names a share, so a missing share means the
+		// volume is already deleted -- typically by an earlier attempt whose reply
+		// was lost to a restart or timeout. CSI requires DeleteVolume to succeed
+		// for a volume that no longer exists. The Anvil can keep the share's
+		// directory for a while after the share object is gone; handing the ID to
+		// the file-backed path then derived a backing share of "/" and failed on
+		// every retry, stranding the PV.
+		log.Infof("share for volume %s no longer exists; treating it as already deleted", volumeId)
+		return &csi.DeleteVolumeResponse{}, nil
 	}
 	// Share exists and is a Filesystem
 	err = d.deleteShareBackedVolume(ctx, share)
