@@ -346,7 +346,7 @@
             },
             {
               "hostPath": {
-                "path": "/var/lib/hammerspace/staging",
+                "path": "/tmp",
                 "type": "DirectoryOrCreate"
               },
               "name": "staging-dir"
@@ -909,7 +909,7 @@
             },
             {
               "hostPath": {
-                "path": "/var/lib/hammerspace/staging",
+                "path": "/tmp",
                 "type": "DirectoryOrCreate"
               },
               "name": "staging-dir"

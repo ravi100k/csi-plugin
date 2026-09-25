@@ -236,7 +236,7 @@ spec:
           emptyDir: {}
         - name: staging-dir
           hostPath:
-            path: /var/lib/hammerspace/staging
+            path: /tmp
             type: DirectoryOrCreate
 ---
 apiVersion: v1
@@ -508,7 +508,7 @@ spec:
             path: /dev
         - name: staging-dir
           hostPath:
-            path: /var/lib/hammerspace/staging
+            path: /tmp
             type: DirectoryOrCreate
 ---
 apiVersion: v1
