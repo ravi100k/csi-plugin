@@ -21,10 +21,59 @@ import (
 // Mount operations are variables so the private-bind sequence can be tested
 // without requiring CAP_SYS_ADMIN.
 var (
-	bindMountDevice     = common.BindMountDevice
-	remountBindReadOnly = common.RemountBindReadOnly
-	unmountFilesystem   = common.UnmountFilesystem
+	bindMountDevice       = common.BindMountDevice
+	remountBindReadOnly   = common.RemountBindReadOnly
+	unmountFilesystem     = common.UnmountFilesystem
+	mountFilesystem       = common.MountFilesystem
+	reconcileFilesystem   = common.ReconcileFilesystemToBackingFile
+	filesystemNeedsGrowth = common.FilesystemNeedsGrowth
 )
+
+// growFilesystemPrivatelyIfNeeded gives the driver a private writable
+// mount on which it can finish growing a restored filesystem before exposing
+// that filesystem to any workload.
+//
+// The writable mount is taken only when the filesystem is actually smaller
+// than its backing file. A ReadOnlyMany volume may already be mounted
+// read-only by other pods, and mounting ext4/xfs writable beside those mounts
+// would write to a filesystem they are reading.
+func growFilesystemPrivatelyIfNeeded(ctx context.Context, backingFile, fsType string) error {
+	grow, err := filesystemNeedsGrowth(backingFile, fsType)
+	if err != nil {
+		return fmt.Errorf("check filesystem size: %w", err)
+	}
+	if !grow {
+		return nil
+	}
+	log.Infof("growing restored filesystem in %s through a private provisioning mount", backingFile)
+	temporary, err := os.MkdirTemp(common.ShareStagingDir, ".hscsi-grow-")
+	if err != nil {
+		return fmt.Errorf("create temporary filesystem mount: %w", err)
+	}
+	mounted := false
+	defer func() {
+		if mounted {
+			if cleanupErr := unmountFilesystem(ctx, temporary); cleanupErr != nil {
+				log.Errorf("failed to clean temporary filesystem mount %s: %v", temporary, cleanupErr)
+			}
+		}
+		if removeErr := os.Remove(temporary); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Errorf("failed to remove temporary filesystem mount %s: %v", temporary, removeErr)
+		}
+	}()
+	if err := mountFilesystem(backingFile, temporary, fsType, nil); err != nil {
+		return fmt.Errorf("mount filesystem temporarily for growth: %w", err)
+	}
+	mounted = true
+	if err := reconcileFilesystem(temporary, backingFile, fsType); err != nil {
+		return fmt.Errorf("reconcile restored filesystem during provisioning: %w", err)
+	}
+	if err := unmountFilesystem(ctx, temporary); err != nil {
+		return fmt.Errorf("unmount temporary filesystem after growth: %w", err)
+	}
+	mounted = false
+	return nil
+}
 
 // bindMountReadOnly binds source to target read-only without changing the
 // mount that contains source, which a staged volume shares with every other pod
@@ -294,35 +343,31 @@ func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareNam
 			// Do not pass them to the local ext4/xfs mount of the backing file.
 			var filesystemMountFlags []string
 			if readOnly {
+				// Provisioning grows restored filesystems before CreateVolume
+				// returns. Never introduce a writable mount from a read-only
+				// publish: another node may already be reading this filesystem.
+				needsGrowth, growthErr := filesystemNeedsGrowth(filePath, fsType)
+				if growthErr != nil {
+					d.UnmountBackingShareIfUnused(ctx, backingShareName)
+					return status.Errorf(codes.Internal, "verify filesystem before read-only publish: %v", growthErr)
+				}
+				if needsGrowth {
+					d.UnmountBackingShareIfUnused(ctx, backingShareName)
+					return status.Errorf(codes.FailedPrecondition, "filesystem in %s has not been grown to its provisioned capacity; publish it writable once or retry CreateVolume reconciliation", filePath)
+				}
 				filesystemMountFlags = append(filesystemMountFlags, "ro")
 			}
-			if err := common.MountFilesystem(filePath, targetPath, fsType, filesystemMountFlags); err != nil {
+			if err := mountFilesystem(filePath, targetPath, fsType, filesystemMountFlags); err != nil {
 				d.UnmountBackingShareIfUnused(ctx, backingShareName)
 				return err
 			}
 		}
 	}
 
-	// A volume restored from a snapshot into a larger PVC has had its raw
-	// backing file grown by the controller (growRestoredDeviceFile), but the
-	// ext4/xfs filesystem inside it is still the snapshot's original size — only
-	// a node has the loop device needed to grow it. Reconcile it here, to the
-	// backing file's CURRENT size rather than to any requested size, so an
-	// already-expanded volume can never be shrunk back.
-	//
-	// This runs on every publish, including one that found the volume already
-	// mounted, because the underlying operations are idempotent no-ops when
-	// there is nothing to grow. That also retries a reconciliation that failed
-	// on an earlier publish attempt, which would otherwise be masked forever by
-	// the "already published" path reporting success.
-	//
-	// KNOWN LIMITATION: skipped for read-only publishes, since resize2fs and
-	// xfs_growfs must write to the filesystem. A larger restored volume whose
-	// first-ever publish is read-only therefore keeps the snapshot's smaller
-	// filesystem. Fixing that would require growing the filesystem through the
-	// driver's own writable staging mount before ever publishing it read-only.
+	// Writable publish retains an idempotent repair path for older volumes or
+	// provisioning attempts interrupted before filesystem reconciliation.
 	if fsType != "" && !readOnly {
-		if err := common.ReconcileFilesystemToBackingFile(targetPath, filePath, fsType); err != nil {
+		if err := reconcileFilesystem(targetPath, filePath, fsType); err != nil {
 			if !mounted {
 				// Fresh mount: this is where a restored volume gets the capacity
 				// its PVC asked for, so a failure here must surface.

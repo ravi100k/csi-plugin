@@ -2,6 +2,7 @@ package common
 
 import (
 	"errors"
+	"os"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -381,5 +382,50 @@ func TestExpandMountedFilesystemTargetsPerFsType(t *testing.T) {
 		if !reflect.DeepEqual(got, expected) {
 			t.Fatalf("%s: expected %v, got %v", tc.fsType, expected, got)
 		}
+	}
+}
+
+// mkfs.ext4 leaves the last 1 MiB of a 1025Mi file unused, and resize2fs
+// cannot use it either, so that gap must not count as needing growth. A
+// restore into a larger PVC leaves a gap far beyond the slack.
+func TestFilesystemNeedsGrowthAllowsUnusableTail(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "filesystem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	original := ExecCommand
+	defer func() { ExecCommand = original }()
+	ExecCommand = func(string, ...string) ([]byte, error) {
+		return []byte("Block count: 262144\nBlock size: 4096\n"), nil
+	}
+	for _, tc := range []struct {
+		size int64
+		grow bool
+	}{
+		{1025 << 20, false}, // 1024Mi filesystem in a 1025Mi file
+		{2 << 30, true},     // 1Gi snapshot restored into a 2Gi PVC
+	} {
+		if err := file.Truncate(tc.size); err != nil {
+			t.Fatal(err)
+		}
+		if grow, err := FilesystemNeedsGrowth(file.Name(), "ext4"); err != nil || grow != tc.grow {
+			t.Fatalf("file size %d: grow=%v err=%v, want grow=%v", tc.size, grow, err, tc.grow)
+		}
+	}
+}
+
+func TestParseFilesystemSize(t *testing.T) {
+	ext4 := "dumpe2fs 1.46.5 (30-Dec-2021)\nFilesystem volume name:   <none>\nBlock count:              262144\nReserved block count:     13107\nBlock size:               4096\n"
+	if got, err := parseFilesystemSize(ext4, "ext4"); err != nil || got != 262144*4096 {
+		t.Fatalf("ext4 size = %d, %v", got, err)
+	}
+	xfs := "dblocks = 524288\nblocksize = 4096\n"
+	if got, err := parseFilesystemSize(xfs, "xfs"); err != nil || got != 524288*4096 {
+		t.Fatalf("xfs size = %d, %v", got, err)
+	}
+	if _, err := parseFilesystemSize("Block count: 10\n", "ext4"); err == nil {
+		t.Fatal("expected error when block size is missing")
 	}
 }

@@ -8,6 +8,75 @@ import (
 	"testing"
 )
 
+func TestGrowFilesystemPrivately(t *testing.T) {
+	originalMount := mountFilesystem
+	originalReconcile := reconcileFilesystem
+	originalUnmount := unmountFilesystem
+	originalNeedsGrowth := filesystemNeedsGrowth
+	defer func() {
+		mountFilesystem = originalMount
+		reconcileFilesystem = originalReconcile
+		unmountFilesystem = originalUnmount
+		filesystemNeedsGrowth = originalNeedsGrowth
+	}()
+	filesystemNeedsGrowth = func(string, string) (bool, error) { return true, nil }
+
+	var temporary string
+	var calls []string
+	mountFilesystem = func(source, target, fsType string, flags []string) error {
+		temporary = target
+		calls = append(calls, "mount:"+source+":"+fsType)
+		if len(flags) != 0 {
+			t.Fatalf("temporary mount flags = %v, want writable mount", flags)
+		}
+		return nil
+	}
+	reconcileFilesystem = func(target, backing, fsType string) error {
+		if target != temporary || backing != "/tmp/share/volume" || fsType != "ext4" {
+			t.Fatalf("unexpected reconcile arguments: %q %q %q", target, backing, fsType)
+		}
+		calls = append(calls, "reconcile")
+		return nil
+	}
+	unmountFilesystem = func(_ context.Context, target string) error {
+		if target != temporary {
+			t.Fatalf("unmount target = %q, want %q", target, temporary)
+		}
+		calls = append(calls, "unmount")
+		return nil
+	}
+
+	if err := growFilesystemPrivatelyIfNeeded(context.Background(), "/tmp/share/volume", "ext4"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"mount:/tmp/share/volume:ext4", "reconcile", "unmount"}) {
+		t.Fatalf("calls = %v", calls)
+	}
+	if _, err := os.Stat(temporary); !os.IsNotExist(err) {
+		t.Fatalf("temporary directory was not removed: %v", err)
+	}
+}
+
+// A filesystem that is already full size must not be mounted writable: a
+// ReadOnlyMany volume may be mounted read-only by other pods at the same time.
+func TestGrowFilesystemPrivatelySkipsFullSizeFilesystem(t *testing.T) {
+	originalMount := mountFilesystem
+	originalNeedsGrowth := filesystemNeedsGrowth
+	defer func() {
+		mountFilesystem = originalMount
+		filesystemNeedsGrowth = originalNeedsGrowth
+	}()
+	filesystemNeedsGrowth = func(string, string) (bool, error) { return false, nil }
+	mountFilesystem = func(source, target, fsType string, flags []string) error {
+		t.Fatalf("unexpected writable mount of %s at %s", source, target)
+		return nil
+	}
+
+	if err := growFilesystemPrivatelyIfNeeded(context.Background(), "/tmp/share/volume", "xfs"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A read-only publish must not remount the staged mount it binds from, which
 // every other pod publishing the same volume shares. The read-only flag goes on
 // a private bind that is removed once the pod target is bound from it.

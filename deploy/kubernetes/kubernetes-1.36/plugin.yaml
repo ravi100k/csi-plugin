@@ -228,12 +228,20 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/
+            # CreateVolume grows a restored ext4/xfs filesystem through a loop
+            # mount. The host /dev is needed to see loop devices the kernel
+            # creates after the container starts.
+            - name: dev-dir
+              mountPath: /dev
             - name: staging-dir
               mountPath: /tmp
               mountPropagation: Bidirectional
       volumes:
         - name: socket-dir
           emptyDir: {}
+        - name: dev-dir
+          hostPath:
+            path: /dev
         - name: staging-dir
           hostPath:
             path: /tmp

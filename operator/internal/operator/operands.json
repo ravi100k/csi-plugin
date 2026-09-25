@@ -321,6 +321,10 @@
                   "name": "socket-dir"
                 },
                 {
+                  "mountPath": "/dev",
+                  "name": "dev-dir"
+                },
+                {
                   "mountPath": "/tmp",
                   "mountPropagation": "Bidirectional",
                   "name": "staging-dir"
@@ -343,6 +347,12 @@
             {
               "emptyDir": {},
               "name": "socket-dir"
+            },
+            {
+              "hostPath": {
+                "path": "/dev"
+              },
+              "name": "dev-dir"
             },
             {
               "hostPath": {

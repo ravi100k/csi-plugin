@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -414,6 +415,85 @@ func ReconcileFilesystemToBackingFile(targetPath, backingFile, fsType string) er
 		return ExpandFilesystem(targetPath, fsType)
 	}
 	return ExpandFilesystem(loopdev, fsType)
+}
+
+// filesystemGrowthSlack is how much smaller than its backing file a filesystem
+// may be and still count as fully grown. mkfs.ext4 and resize2fs leave a
+// trailing partial block group unused when it is too small for its own
+// metadata (1 MiB of a 1025Mi file, for example), and older mkfs.xfs drops a
+// trailing allocation group under 16 MiB, so no filesystem can close such a
+// gap. A smaller slack would make those volumes need growth forever.
+const filesystemGrowthSlack = 16 << 20
+
+// FilesystemNeedsGrowth reports whether the ext4/xfs filesystem inside
+// backingFile is smaller than the file itself, i.e. a restored volume whose
+// filesystem has not yet been grown to the capacity its backing file was given.
+// It reads the superblock without mounting, so it is safe while the filesystem
+// is mounted read-only elsewhere.
+func FilesystemNeedsGrowth(backingFile, fsType string) (bool, error) {
+	info, err := os.Stat(backingFile)
+	if err != nil {
+		return false, err
+	}
+	var output []byte
+	if fsType == "xfs" {
+		output, err = ExecCommand("xfs_db", "-r", "-c", "sb 0", "-c", "print dblocks blocksize", backingFile)
+	} else {
+		output, err = ExecCommand("dumpe2fs", "-h", backingFile)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s superblock of %s: %w: %s", fsType, backingFile, err, output)
+	}
+	blockCount, blockSize, err := parseFilesystemGeometry(string(output), fsType)
+	if err != nil {
+		return false, fmt.Errorf("read %s superblock of %s: %w", fsType, backingFile, err)
+	}
+	return info.Size()-blockCount*blockSize > filesystemGrowthSlack, nil
+}
+
+// parseFilesystemGeometry extracts the block count and block size from dumpe2fs -h
+// or xfs_db "print dblocks blocksize" output.
+func parseFilesystemGeometry(output, fsType string) (int64, int64, error) {
+	countKey, sizeKey, sep := "Block count", "Block size", ":"
+	if fsType == "xfs" {
+		countKey, sizeKey, sep = "dblocks", "blocksize", "="
+	}
+	values := map[string]int64{}
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(line, sep)
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key != countKey && key != sizeKey {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("parse %s: %w", key, err)
+		}
+		values[key] = n
+	}
+	count, haveCount := values[countKey]
+	size, haveSize := values[sizeKey]
+	if !haveCount || !haveSize {
+		return 0, 0, fmt.Errorf("superblock output has no %q and %q", countKey, sizeKey)
+	}
+	if count <= 0 || size <= 0 {
+		return 0, 0, fmt.Errorf("invalid filesystem geometry: %s=%d %s=%d", countKey, count, sizeKey, size)
+	}
+	return count, size, nil
+}
+
+func parseFilesystemSize(output, fsType string) (int64, error) {
+	count, size, err := parseFilesystemGeometry(output, fsType)
+	if err != nil {
+		return 0, err
+	}
+	if count > math.MaxInt64/size {
+		return 0, fmt.Errorf("filesystem size overflows int64")
+	}
+	return count * size, nil
 }
 
 func FormatDevice(ctx context.Context, device, fsType string) error {

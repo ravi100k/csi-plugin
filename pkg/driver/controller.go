@@ -430,44 +430,45 @@ func (d *CSIDriver) ensureBackingShareExists(ctx context.Context, backingShareNa
 }
 
 // growRestoredDeviceFile grows a just-restored backing file to the capacity the
-// PVC actually asked for. It mounts the backing share (refcounted, so a
-// concurrent create on the same share keeps it alive) purely to reach the file
-// as a local path, and grows the raw file only — no loop device is attached and
-// no filesystem is touched, both of which are the node's job at publish time.
+// PVC actually asked for. It reconciles both the sparse raw file and an
+// embedded ext4/xfs filesystem before CreateVolume returns.
 //
-// Whether growth is needed is decided from Anvil metadata FIRST, so a same-size
-// restore -- the common case -- returns without mounting anything. Mounting
-// merely to stat the file made the ordinary path depend on an NFS mount and a
-// fresh dentry, and could fail it for work that was never required.
+// Raw-file growth is decided from Anvil metadata first. For ext4/xfs restores,
+// the backing share is also mounted long enough to verify and, when necessary,
+// grow the embedded filesystem before the volume becomes publishable.
 func (d *CSIDriver) growRestoredDeviceFile(ctx context.Context, backingShare *common.ShareResponse, hsVolume *common.HSVolume, deviceFile string) error {
 	restored, err := d.hsclient.GetFile(ctx, hsVolume.Path)
 	if err != nil {
 		return status.Errorf(codes.Internal, "could not look up restored file %s: %v", hsVolume.Path, err)
 	}
-	if restored != nil && restored.Size >= hsVolume.Size {
-		log.Debugf("restored file %s is already %d bytes, no growth needed", hsVolume.Path, restored.Size)
+	rawGrowthNeeded := restored == nil || restored.Size < hsVolume.Size
+	filesystemGrowthPossible := hsVolume.FSType == "ext4" || hsVolume.FSType == "xfs"
+	if !rawGrowthNeeded && !filesystemGrowthPossible {
 		return nil
 	}
 
+	// CreateVolume has not returned yet, so no node can publish this new volume.
+	// This is the only safe window for the controller to mount a restored
+	// filesystem writable without racing a MULTI_NODE_READER_ONLY consumer.
 	if err := d.acquireBackingMount(ctx, backingShare, hsVolume); err != nil {
-		log.Errorf("failed to ensure backing share is mounted to grow restored file, %v", err)
-		return err
+		return status.Errorf(codes.Internal, "mount backing share to reconcile restored volume: %v", err)
 	}
 	defer d.releaseBackingMount(ctx, backingShare)
 
-	// Re-check locally: Anvil metadata can lag the file that was just written.
-	info, statErr := os.Stat(deviceFile)
-	if statErr != nil {
-		return status.Errorf(codes.Internal, "could not stat restored file %s: %v", deviceFile, statErr)
+	info, err := os.Stat(deviceFile)
+	if err != nil {
+		return status.Errorf(codes.Internal, "could not stat restored file %s: %v", deviceFile, err)
 	}
-	if info.Size() >= hsVolume.Size {
-		log.Debugf("restored file %s is already %d bytes, no growth needed", deviceFile, info.Size())
-		return nil
+	if info.Size() < hsVolume.Size {
+		log.Infof("growing restored file %s from %d to %d bytes", deviceFile, info.Size(), hsVolume.Size)
+		if err := common.ExpandRawFileSize(deviceFile, hsVolume.Size); err != nil {
+			return status.Errorf(codes.Internal, "could not grow restored file %s to %d bytes: %v", deviceFile, hsVolume.Size, err)
+		}
 	}
-
-	log.Infof("growing restored file %s from %d to %d bytes", deviceFile, info.Size(), hsVolume.Size)
-	if err := common.ExpandRawFileSize(deviceFile, hsVolume.Size); err != nil {
-		return status.Errorf(codes.Internal, "could not grow restored file %s to %d bytes: %v", deviceFile, hsVolume.Size, err)
+	if filesystemGrowthPossible {
+		if err := growFilesystemPrivatelyIfNeeded(ctx, deviceFile, hsVolume.FSType); err != nil {
+			return status.Errorf(codes.Internal, "could not grow restored %s filesystem in %s: %v", hsVolume.FSType, deviceFile, err)
+		}
 	}
 	return nil
 }
@@ -489,8 +490,13 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 	resumingRestore := false
 	if file != nil {
 		switch {
-		case file.Size == hsVolume.Size:
+		case file.Size == hsVolume.Size && hsVolume.SourceSnapPath == "":
 			return nil
+		case file.Size == hsVolume.Size:
+			// A previous CreateVolume attempt may have grown the raw file and
+			// stopped before growing the restored filesystem. Re-enter the
+			// reconciliation path; it is idempotent when already complete.
+			resumingRestore = true
 		case hsVolume.SourceSnapPath != "" && file.Size < hsVolume.Size:
 			// A snapshot restore that grows the raw file after
 			// RestoreFileSnapToDestination (below) can be interrupted between the
@@ -545,13 +551,8 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 			}
 		}
 
-		// RestoreFileSnapToDestination has no size parameter: the restored file is
-		// always exactly the snapshot's size, even when the PVC asked for a larger
-		// one. Grow the raw file here so the volume really has the capacity it was
-		// provisioned with. Only the file's byte size can be fixed from the
-		// controller — the ext4/xfs filesystem inside it needs a loop device, which
-		// exists only once a node publishes the volume, so publishFileBackedVolume
-		// reconciles the filesystem to this new size.
+		// Reconcile the sparse raw file and its embedded filesystem before
+		// CreateVolume returns, while no node can publish the volume.
 		if err := d.growRestoredDeviceFile(ctx, backingShare, hsVolume, deviceFile); err != nil {
 			return err
 		}
