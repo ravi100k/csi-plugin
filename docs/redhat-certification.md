@@ -88,3 +88,52 @@ Document supported OpenShift/RHCOS/RHEL versions, node prerequisites, privileged
 access, unsupported OpenShift Virtualization storage features, and differences
 between patch, minor and major upgrades. Repeat certification for each required
 OpenShift minor release and rebuild promptly for security updates.
+
+**Upgrading from 1.3.x or earlier** changes how NFS volumes are mounted on a node,
+so it needs the node drain in `deploy/kubernetes/README.md` ("Upgrading from
+1.3.x or earlier"). The update test must follow that procedure and confirm that
+existing NFS data is intact afterwards. It must also cover a pod started on a
+drained node against a volume created before the upgrade. Customer upgrade
+documentation must include the drain step.
+
+## 4. Test environment
+
+The OpenShift CSI suite fails for reasons that have nothing to do with the
+driver when the environment is wrong. Each of these came up during the 2026-09
+certification work; details are in `openshift-certification-results.md`.
+
+- **StorageClasses must use `volumeBindingMode: WaitForFirstConsumer`**, as the
+  Operator ships them. The external-provisioner publishes no
+  `CSIStorageCapacity` for an `Immediate` class, so the capacity test cannot pass
+  against one.
+- **NFS `mountOptions` must request a version the data portals serve.** Check the
+  portals' `dataPortalType` first. A portal without NFSv4.2 fails every mount
+  that asks for `vers=4.2`.
+- **LUN Overflow creates 260 pods and PVCs on one node** and must finish within
+  60 minutes. It passed on 2026-09-23, and failed on later runs for three
+  unrelated reasons:
+  - **Pod limit:** a single node with the default `maxPods` of 250, already
+    running about 135 platform pods, reports `Too many pods`. A platform pod can
+    then preempt a test pod, which aborts the test (`unexpected pod count`). Use
+    a multi-node cluster or raise `maxPods` on the test node.
+  - **Anvil throughput:** the Anvil must create and *publish* about 260 shares
+    within the hour. A share can be mounted only once it is published, and on a
+    loaded Anvil that took more than 8 minutes. Use an Anvil that is not running
+    other work.
+  - **Deletes from the previous run:** after a run, the Anvil keeps processing
+    that run's share deletes for a long time. Before starting another profile,
+    wait until the previous run's PVs are gone.
+- **Run a short pre-flight check first:** provision a volume from every
+  StorageClass, mount it in a pod, and write to it. It takes about 2 minutes and
+  catches credential, portal and mount problems that the suite reports only after
+  an hour.
+- **Start from a clean base:** no leftover PVs, e2e namespaces or test shares, and
+  no stale NFS mounts to a previous Anvil on the node. A hard NFS mount to an
+  unreachable Anvil can hang the driver.
+- **A non-zero exit is not by itself a driver failure.** The suite also exits
+  non-zero for cluster monitor tests, such as
+  `kubelet-container-restarts` and `required-scc-annotation`. Most of these are
+  about OpenShift's own workloads. Separate blocking test failures from monitor
+  failures, and check whether any monitor failure names the driver's namespace
+  or StorageClasses before submitting.
+

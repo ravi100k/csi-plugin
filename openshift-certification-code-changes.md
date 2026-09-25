@@ -149,6 +149,146 @@ failed on NFS.
 
 **Verified:** the capacity test passes in the 2026-09-24 full NFS run.
 
+## 8. Nested NFS volumes get their own mount, like native NFS
+
+**Files:** `pkg/driver/node.go` (`NodeStageVolume`, `NodePublishVolume`),
+`pkg/driver/node_helper.go` (`stageNestedNFSVolume`, `nestedNFSSubPath`,
+`bindMountReadOnly`, `publishShareBackedVolume`), `pkg/driver/utils.go`
+(`mountShareSubPathAtBestDataportal`), `pkg/driver/controller.go`
+(`ensureNFSDirectoryExists`), `pkg/common/host_utils.go`
+(`RemountBindReadOnly`), `pkg/driver/node_bind_options_test.go`,
+`pkg/common/host_utils_test.go`
+
+A nested NFS volume is a directory inside a backing share (StorageClass
+`fsType: nfs` plus `mountBackingShareName`).
+
+**Why:** nested volumes were published by binding out of the node's shared
+backing-share mount, which also serves every file-backed and block volume on
+that share. To give each nested volume its own mount options, the driver
+remounted that shared mount:
+- **At publish:** a bind remount of the whole shared mount with the volume's
+  flags. A volume with `ro` made the backing share read-only for everyone, so
+  `qemu-img` create/resize, mkfs and metadata writes for unrelated volumes failed
+  with EROFS. Each later publish also reset the flags for every volume.
+- **At first mount:** the node mounted the backing share with the options of
+  whichever volume got there first, and so did the controller when it created a
+  nested volume's directory. The same `ro` could be baked in from the start.
+
+Avoiding that needed a hand-kept list of which options are per-mount flags
+(`isBindMountOption`), which would have to track new kernel flags.
+
+**Fix:** the same layout other NFS CSI drivers use (csi-driver-nfs, Azure File,
+CephFS): every volume gets its own NFS mount on the node, and nothing binds
+volumes out of a shared mount.
+- **Stage:** `NodeStageVolume` mounts the nested volume's own directory
+  (`portal:/<backing share>/<volume>`) at the CSI staging path, with the volume's
+  mount options, exactly as it does for a native NFS volume. The portal is chosen
+  by matching the backing share's export, because the directory isn't an export
+  itself.
+- **Publish:** `NodePublishVolume` binds the staged mount into the pod, the same
+  path native NFS uses.
+- **Read-only:** a read-only publish (`req.GetReadonly()`) now makes the pod's
+  bind read-only for both native and nested NFS volumes, through a private bind.
+  Before, it was ignored for NFS (known issue 2 below).
+- **Controller:** it mounts the backing share with no volume options when it
+  creates a nested volume's directory.
+- **Shared backing-share mount:** now used only by file-backed and block volumes,
+  whose StorageClass `mountOptions` are by design the backing share's NFS
+  options. Nothing remounts it.
+- **Removed:** `publishShareBackedDirBasedVolume`, the option splitter and the
+  per-mount flag list. There's no list left to maintain.
+
+- **Own superblock (`nosharecache`):** nested volumes are mounted with
+  `nosharecache` (`nestedNFSMountFlags`). Without it, the kernel NFS client
+  gives mounts of the same export one shared superblock. A nested volume's
+  staging mount then shows the same device and root as the backing share's mount
+  and as other nested volumes on that share, and kubelet's `GetDeviceMountRefs`
+  check refuses to unstage the volume while any of those stay mounted. This was
+  reproduced on the cluster: a nested volume stayed staged, with its
+  VolumeAttachment stuck, until the backing share was unmounted. A StorageClass
+  that sets `sharecache` or `nosharecache` itself is left alone.
+
+**Cost:** one NFS mount per nested volume per node, the same cost already
+accepted for native NFS.
+
+**Checked on the portals before writing it:** a directory inside a backing share
+mounts directly over NFSv3 and v4.1, the two versions the lab portals serve.
+
+**Verified** on the cluster with the `nosharecache-20260924` image. Two nested
+volumes (one with StorageClass `ro,noatime`) and an ext4 volume ran on the same
+backing share at the same time:
+
+| Check | Result |
+| --- | --- |
+| Mounts | Each nested volume had its own NFS mount and superblock, separate from the backing share's (`0:477`, `0:464`, `0:478`) |
+| Nested volume with StorageClass `ro` | Writes denied inside the pod |
+| Other nested volume and the ext4 volume | Writable |
+| Shared backing mount | Stayed `rw,relatime` |
+| Read-only publish of a native NFS volume (`readOnly: true` on the claim) | Read-only in the pod, while a second pod publishing it read-write kept write access |
+| Unstaging | After the pods were deleted, all three volumes unstaged and their VolumeAttachments were removed within 9 seconds, with the backing share still mounted |
+| Temporary private mounts left behind | 0 |
+
+Unit tests cover the read-only private bind sequence, how a nested volume's
+directory is derived from its ID, and the `nosharecache` default.
+
+A note on StorageClass `ro`: the container runtime (CRI-O/runc) remounts a
+volume read-write inside the container unless the pod asks for read-only. `ro`
+in `mountOptions` held inside the pod for a nested volume, because the volume's
+own superblock is read-only. It was not enforced when the nested volume shared a
+superblock with the read-write backing share, before `nosharecache`. Native NFS
+with StorageClass `ro` was not tested. A read-only publish (`readOnly: true` on
+the claim) was verified to be enforced.
+
+## 9. Liveness probe waits up to 10s for the driver's Probe
+
+**Files:** `deploy/kubernetes/kubernetes-1.36/plugin.yaml` (canonical),
+`operator/internal/operator/operands.json` (regenerated with `make generate`)
+
+**Why:** the driver's Probe logs in to the Anvil. The liveness sidecar's default
+`--probe-timeout` is 1 s, so whenever the Anvil answered more slowly, a healthy
+driver failed its probe and kubelet restarted it. Overnight on 2026-09-24,
+while the Anvil worked through deleting 260 LUN Overflow shares, this restarted
+the node plugin 51 times and the controller 112 times over about 8 hours. About
+180 of the failures were `context deadline exceeded`. Each restart interrupts
+in-flight mounts, which is the likely reason LUN Overflow ran out of time in
+that NFS run.
+
+**Fix:**
+- The sidecar in both workloads gets `--probe-timeout=10s`.
+- kubelet's `timeoutSeconds` goes from 3 to 15, so kubelet doesn't cut the
+  check off before the sidecar answers.
+- A failed login still fails the probe immediately; only a slow answer is
+  tolerated.
+- The operator must be rebuilt to pick this up, since it compiles the manifest in
+  and force-applies it.
+
+**Verified:** both live workloads carry the new settings, with the operator and
+driver images `probefix-20260925`.
+
+## 10. `DeleteVolume` succeeds for a share-backed volume that is already gone
+
+**Files:** `pkg/driver/controller.go` (`DeleteVolume`), new
+`pkg/driver/delete_volume_test.go`
+
+**Why:** a share-backed volume whose share no longer existed was handed to the
+file-backed delete path as a "legacy" case.
+- **When the share's directory still existed:** the Anvil can keep it for a while
+  after the share object is deleted. The path then derived a backing share of `/`
+  and failed with `unable to get backing share /: <nil>` on every retry, so the
+  PV was never removed. Seen after the driver restarts above: a LUN Overflow PV
+  failed 37 times.
+- **When the directory was gone:** the path returned success anyway, so it never
+  did anything useful for these IDs.
+
+A single-segment volume ID always names a share, and CSI requires
+`DeleteVolume` to succeed for a volume that no longer exists.
+
+**Fix:** when the share is missing, return success.
+
+**Verified:** a unit test checks that the delete succeeds without any further
+Anvil calls. On the cluster, the stuck PV was deleted within seconds of the new
+controller starting.
+
 ## 7. Makefile: `GITHASH ?=` → `GITHASH =`
 
 Your change. With `=`, the image's version label always comes from the tree
@@ -166,18 +306,16 @@ variable. Please confirm this is the intent.
 
 ## Known issues found in review, not changed
 
-1. **Upgrade from the root-export design (untested).** Existing pods keep
-   working. However, a *new* pod that uses a volume already staged on that node
-   by the old driver will fail with `FailedPrecondition`: the staging path has
-   nothing mounted, and kubelet won't re-stage an already-staged volume. It
-   clears once every pod using that volume has left the node. Possible fix: when
-   publishing a volume that has a legacy marker, mount the share at the staging
-   path on demand.
-2. **`readOnly` is ignored for native NFS publish.** `req.GetReadonly()` is passed
-   only to file-backed publish, so a read-only native-NFS mount is still bound
-   read-write. This predates these changes: the old bind path ignored it too.
+1. **Upgrade from the root-export design (untested): documented, not changed.**
+   A new pod using a volume the old driver already staged on that node is
+   refused until the volume leaves that node; existing pods keep working. The
+   supported path is to drain each node after updating the plugin, now
+   documented in `deploy/kubernetes/README.md` ("Upgrading from 1.3.x or
+   earlier"), `CHANGELOG.md` (1.4.0) and `docs/redhat-certification.md`. The
+   legacy marker and root-mount cleanup in `NodeUnstageVolume` is kept for that
+   drain.
+2. ~~**`readOnly` is ignored for native NFS publish.**~~ Fixed by change 8.
 3. **`NodeUnpublishVolume` can hang on a dead hard NFS mount.** `os.Lstat` on the
    target blocks with no timeout. A time-bounded `lstat` with force-detach was
    proposed but not implemented.
-4. **Livenessprobe timeout.** The sidecar's default `--probe-timeout` of 1s is
-   shorter than a Probe that has to log in to the Anvil again.
+4. ~~**Livenessprobe timeout.**~~ Fixed by change 9.
