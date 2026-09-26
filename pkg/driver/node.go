@@ -538,7 +538,7 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 		// Ensure it's file-backed, otherwise no-op
 		// Resize device
 		backingFile := common.ShareStagingDir + req.GetVolumeId()
-		err := common.ExpandDeviceFileSize(backingFile, requestedSize)
+		loopDevice, err := common.ExpandDeviceFileSize(backingFile, requestedSize)
 		if err != nil {
 			return nil, err
 		}
@@ -547,7 +547,7 @@ func (d *CSIDriver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVol
 			return nil, err
 		}
 		if fsType != "" {
-			err = common.ExpandFilesystem(req.GetVolumePath(), fsType)
+			err = common.ExpandFilesystem(req.GetVolumePath(), loopDevice, fsType)
 			if err != nil {
 				return nil, err
 			}
@@ -587,7 +587,7 @@ func nodeExpansionFilesystemType(req *csi.NodeExpandVolumeRequest, backingFile s
 
 	fsType, err := filesystemType(backingFile)
 	if err != nil {
-		return "", status.Errorf(codes.Internal, "could not determine filesystem type at %q: %v", req.GetVolumePath(), err)
+		return "", status.Errorf(codes.Internal, "could not determine filesystem type of %q: %v", backingFile, err)
 	}
 	return fsType, nil
 }

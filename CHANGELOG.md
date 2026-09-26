@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.1]
+### Fixed
+- Online expansion of mounted file-backed volumes. v1.3.0 grew the backing file and refreshed its loop device, then ran `xfs_growfs` against the backing file (`/var/lib/hammerspace/volumes/<volume-id>`). `xfs_growfs` only accepts a mounted filesystem, so XFS PVCs never grew online and stayed in `FileSystemResizePending`. `NodeExpandVolume` now picks the target per filesystem: `xfs_growfs` gets the request's `volume_path`, and ext4's `resize2fs` gets the loop device (it rejects a directory). A mount volume without a `volume_path` is rejected with `InvalidArgument`. Filesystem types other than `xfs` and `ext4` are rejected with `InvalidArgument` instead of being passed to `resize2fs`. (#72)
+- When the optional CSI `volume_capability` is absent, `NodeExpandVolume` reads the filesystem type from the loop device's on-disk signature (`blkid`). Previously it treated the volume as raw block and skipped the filesystem grow. (HS-42237)
+
 ## [1.3.0]
 ### Added
 - `objectiveTarget` StorageClass parameter (`share` (default) | `file` | `both`) for file-backed volumes. With the default `share`, CreateVolume skips the per-file objective-set and the Anvil file-visibility poll that only exists to gate it — the backing share already carries the objectives — so provisioning returns as soon as the local `mkfs` completes and the `GET /files` poll storm under concurrency is eliminated. Use `file`/`both` to also apply per-file objectives.
@@ -36,7 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AnvilRoute` collapses `share-snapshots` share/snapshot identifiers to `{id}`, preventing unbounded `hs_csi_anvil_requests_total` metric cardinality.
 - Survive a stale/dead backing-share NFS mount (timeout-bounded mount + force-unmount before remount) instead of leaking the lock and wedging serialized provisioning. See `docs/node-unmount-recovery.md`.
 - Route file-backed snapshot deletes to the file-snapshot API instead of always calling the share-snapshot delete.
-- `NodeExpandVolume` now grows file-backed filesystems using the request's actual mount point (`req.GetVolumePath()`) instead of reconstructing the backing-file path. When the optional CSI `volume_capability` is absent, the driver discovers the filesystem type from that mount point instead of silently treating the volume as raw block. `xfs_growfs` requires a mounted filesystem argument, so either behavior previously left online XFS expansion incomplete and the PVC in `FileSystemResizePending`. (#72)
 - Guarded the `CreateSnapshot` dedup cache (`recentlyCreatedSnapshots`) with its own mutex, independent of the per-snapshot-name lock. The per-name lock only serializes calls for the same snapshot name; concurrent `CreateSnapshot` calls for different names could read/write the shared map at the same instant, which is a fatal, crash-the-process condition in Go. (#73)
 
 ### Security

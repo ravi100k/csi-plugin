@@ -201,19 +201,30 @@ func MountFilesystem(sourcefile, destfile, fsType string, mountFlags []string) e
 	return nil
 }
 
-func ExpandFilesystem(device, fsType string) error {
-	log.Infof("Resizing filesystem on file '%s' with '%s' filesystem", device, fsType)
+// ExpandFilesystem grows the filesystem on a file-backed volume after its loop
+// device has been refreshed. xfs_growfs only operates on a mounted filesystem
+// and must be given the mount point; resize2fs needs the block device and
+// rejects a directory. Filesystems without an online grow path are refused
+// rather than handed to resize2fs.
+func ExpandFilesystem(mountPath, device, fsType string) error {
+	log.Infof("Resizing '%s' filesystem mounted at '%s' on device '%s'", fsType, mountPath, device)
 
-	var command string
-	if fsType == "xfs" {
-		command = "xfs_growfs"
-	} else {
-		command = "resize2fs"
+	var command, target string
+	switch fsType {
+	case "xfs":
+		command, target = "xfs_growfs", mountPath
+	case "ext4":
+		command, target = "resize2fs", device
+	default:
+		return status.Errorf(codes.InvalidArgument, "online expansion is not supported for filesystem type %q", fsType)
 	}
-	output, err := ExecCommand(command, device)
+	if target == "" {
+		return status.Errorf(codes.InvalidArgument, "cannot expand %s filesystem: empty target", fsType)
+	}
+	output, err := ExecCommand(command, target)
 	if err != nil {
-		log.Errorf("Could not expand filesystem on device %s: %s: %s", device, err.Error(), output)
-		return err
+		log.Errorf("Could not expand filesystem on %s: %s: %s", target, err.Error(), output)
+		return status.Errorf(codes.Internal, "%s %s failed: %v: %s", command, target, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -298,13 +309,14 @@ func MakeEmptyRawFile(ctx context.Context, pathname string, size int64) error {
 	return nil
 }
 
-func ExpandDeviceFileSize(pathname string, size int64) error {
+// ExpandDeviceFileSize grows the backing file and refreshes its loop device,
+// returning the loop device so the caller can grow the filesystem on it.
+func ExpandDeviceFileSize(pathname string, size int64) (string, error) {
 	log.Infof("resizing device file '%s'", pathname)
 	sizeStr := strconv.FormatInt(size, 10)
 	loopdev, err := determineLoopDeviceFromBackingFile(pathname)
 	if err != nil {
-		// log.Errorf("DFERR: loopdev: '%s', error: '%v'", loopdev, err.Error())
-		return err
+		return "", err
 	}
 	// Order matters (issue #71): grow the backing file FIRST, then refresh the loop
 	// device. losetup -c (LOOP_SET_CAPACITY) makes the kernel re-read the backing
@@ -315,16 +327,16 @@ func ExpandDeviceFileSize(pathname string, size int64) error {
 	output, err := ExecCommand("qemu-img", "resize", "-fraw", pathname, sizeStr)
 	if err != nil {
 		log.Errorf("%s, %v", output, err.Error())
-		return err
+		return "", err
 	}
 	// Refresh the loop device size with losetup -c
 	// Requires UBI image
 	loresize, err := ExecCommand("losetup", "-c", loopdev)
 	if err != nil {
 		log.Errorf("Resizing loop device '%s' failed with output '%s': '%v'", loopdev, loresize, err.Error())
-		return err
+		return "", err
 	}
-	return nil
+	return loopdev, nil
 }
 
 func FormatDevice(ctx context.Context, device, fsType string) error {

@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestGetNFSExports(t *testing.T) {
@@ -193,8 +196,12 @@ func TestExpandDeviceFileSizeOrdering(t *testing.T) {
 		return []byte(""), nil
 	}
 
-	if err := ExpandDeviceFileSize(backing, 2147483648); err != nil {
+	gotLoop, err := ExpandDeviceFileSize(backing, 2147483648)
+	if err != nil {
 		t.Fatalf("ExpandDeviceFileSize returned error: %v", err)
+	}
+	if gotLoop != loopdev {
+		t.Errorf("ExpandDeviceFileSize loop device = %q, want %s", gotLoop, loopdev)
 	}
 
 	idxResize, idxRefresh := -1, -1
@@ -248,5 +255,54 @@ func TestGetFilesystemTypeUsesDeviceSignature(t *testing.T) {
 	}
 	if fsType != "btrfs" {
 		t.Fatalf("filesystem type = %q, want btrfs", fsType)
+	}
+}
+
+// TestExpandFilesystemTarget guards the online-expansion fix: xfs_growfs must be
+// given the mounted volume path (it rejects a backing file or device), while
+// resize2fs must be given the loop device (it rejects a directory).
+func TestExpandFilesystemTarget(t *testing.T) {
+	original := ExecCommand
+	defer func() { ExecCommand = original }()
+
+	const mountPath = "/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pvc/mount"
+	const device = "/dev/loop7"
+	cases := []struct {
+		fsType, wantCmd, wantTarget string
+	}{
+		{"xfs", "xfs_growfs", mountPath},
+		{"ext4", "resize2fs", device},
+	}
+	for _, tc := range cases {
+		var calls [][]string
+		ExecCommand = func(command string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{command}, args...))
+			return nil, nil
+		}
+		if err := ExpandFilesystem(mountPath, device, tc.fsType); err != nil {
+			t.Fatalf("%s: ExpandFilesystem returned error: %v", tc.fsType, err)
+		}
+		want := []string{tc.wantCmd, tc.wantTarget}
+		if len(calls) != 1 || !reflect.DeepEqual(calls[0], want) {
+			t.Fatalf("%s: calls = %v, want [%v]", tc.fsType, calls, want)
+		}
+	}
+}
+
+func TestExpandFilesystemRejectsUnsupported(t *testing.T) {
+	original := ExecCommand
+	defer func() { ExecCommand = original }()
+	ExecCommand = func(command string, args ...string) ([]byte, error) {
+		t.Fatalf("unexpected command %q", command)
+		return nil, nil
+	}
+
+	for _, fsType := range []string{"ext2", "ext3", "btrfs"} {
+		if err := ExpandFilesystem("/mnt/volume", "/dev/loop7", fsType); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("%s: error = %v, want InvalidArgument", fsType, err)
+		}
+	}
+	if err := ExpandFilesystem("", "/dev/loop7", "xfs"); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("xfs with empty mount path: error = %v, want InvalidArgument", err)
 	}
 }

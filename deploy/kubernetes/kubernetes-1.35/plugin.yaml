@@ -125,7 +125,7 @@ spec:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
           imagePullPolicy: Always
-          image: hammerspaceinc/csi-plugin:v1.3.0
+          image: hammerspaceinc/csi-plugin:v1.3.1
           ports:
             - containerPort: 9090
               name: metrics
@@ -332,7 +332,7 @@ spec:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
           imagePullPolicy: Always
-          image: hammerspaceinc/csi-plugin:v1.3.0
+          image: hammerspaceinc/csi-plugin:v1.3.1
           ports:
             - containerPort: 9091
               name: metrics
