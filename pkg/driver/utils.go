@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,6 +36,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/mount-utils"
 
 	common "github.com/hammer-space/csi-plugin/pkg/common"
 )
@@ -314,12 +316,30 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 		// would otherwise `umount -f -l` a live shared backing mount out from
 		// under other in-flight file-backed pods (the same outage this path is
 		// meant to prevent, via a false positive).
-		state := classifyMount(backingDir, mountStaleProbes, common.SafeIsMountPoint)
+		state := classifyMount(backingDir, mountStaleProbes, isMountPoint)
 		log.Debugf("Checked mount for %s: state=%d", backingDir, state)
 		switch state {
 		case mountHealthy:
-			log.Infof("backing share already mounted, %s", backingDir)
-			return nil
+			server := d.foreignBackingMountServer(ctx, backingDir, hsVol.FQDN)
+			if server == "" {
+				log.Infof("backing share already mounted, %s", backingDir)
+				return nil
+			}
+			// Reusing this mount would create and read volume files on another
+			// Anvil's share. Replace it, unless volumes on it are still attached.
+			inUse, err := backingFilesInUse(backingDir)
+			if err != nil {
+				return err
+			}
+			if inUse {
+				return status.Errorf(codes.FailedPrecondition,
+					"backing share %s is mounted at %s from %s, which is not an NFS server of the current Anvil, and loop devices still use it; unmount it once no pod uses volumes from that server",
+					backingShare.ExportPath, backingDir, server)
+			}
+			log.Warnf("backing share %s is mounted from %s, which is not an NFS server of the current Anvil; remounting", backingDir, server)
+			if err := unmountFilesystem(ctx, backingDir); err != nil {
+				return err
+			}
 		case mountStale:
 			// A hung/stale NFS mount is lingering (server unreachable). Force-clear
 			// it best-effort so the mount below re-establishes against the CURRENT
@@ -343,6 +363,125 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 		return nil
 	}
 	return nil
+}
+
+// Backing-mount inspection, as variables so tests can replace the mount
+// table, the Anvil and losetup.
+var (
+	backingMountServer = mountedNFSServer
+	nfsServerAddresses = func(d *CSIDriver, ctx context.Context) ([]string, error) {
+		return d.hsclient.NFSServerAddresses(ctx)
+	}
+	backingFilesInUse = loopDevicesUnder
+	lookupIP          = net.LookupIP
+)
+
+// foreignBackingMountServer returns the server of the NFS mount at path when
+// the driver would not mount from it now: it is not an up data portal, a
+// floating IP, or the StorageClass FQDN. This happens when the driver is
+// pointed at a new Anvil while the old one is still reachable, so the mount
+// still looks healthy. Mounts made on the host reach the driver through its
+// /tmp host path, so a new driver pod can inherit one.
+//
+// It returns "" when the mount is current, and also when the Anvil can't be
+// asked, so an Anvil outage never takes down a working mount.
+func (d *CSIDriver) foreignBackingMountServer(ctx context.Context, path, fqdn string) string {
+	server, err := backingMountServer(path)
+	if err != nil || server == "" {
+		return ""
+	}
+	addresses, err := nfsServerAddresses(d, ctx)
+	if err != nil {
+		log.Warnf("could not list the Anvil's NFS servers, keeping the mount at %s: %v", path, err)
+		return ""
+	}
+	if fqdn != "" {
+		if ips, err := lookupIP(fqdn); err == nil {
+			for _, ip := range ips {
+				addresses = append(addresses, ip.String())
+			}
+		}
+	}
+	if len(addresses) == 0 {
+		// Nothing to compare against; the mount below couldn't pick a server either.
+		return ""
+	}
+	if serverIn(server, addresses) {
+		return ""
+	}
+	return server
+}
+
+// serverIn reports whether server, an IP or host name, is one of addresses.
+func serverIn(server string, addresses []string) bool {
+	candidates := []net.IP{net.ParseIP(server)}
+	if candidates[0] == nil {
+		ips, err := lookupIP(server)
+		if err != nil {
+			// Can't tell; treat it as current rather than unmount it.
+			return true
+		}
+		candidates = ips
+	}
+	for _, a := range addresses {
+		ip := net.ParseIP(a)
+		for _, c := range candidates {
+			if ip != nil && ip.Equal(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mountedNFSServer returns the server of the topmost NFS mount at path, or ""
+// when no NFS filesystem is mounted there. It reads the mount table and never
+// touches the mount, so a dead server can't hang it.
+func mountedNFSServer(path string) (string, error) {
+	mounts, err := mount.New("").List()
+	if err != nil {
+		return "", err
+	}
+	server := ""
+	for _, m := range mounts {
+		// Later entries are mounted on top of earlier ones.
+		if m.Path == path && strings.HasPrefix(m.Type, "nfs") {
+			server = nfsSourceHost(m.Device)
+		}
+	}
+	return server, nil
+}
+
+// nfsSourceHost returns the host part of an NFS mount source such as
+// "10.0.0.1:/share" or "[fd00::1]:/share".
+func nfsSourceHost(source string) string {
+	i := strings.Index(source, ":/")
+	if i <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(source[:i], "["), "]")
+}
+
+// loopDevicesUnder reports whether any loop device is backed by a file under
+// mountPath.
+func loopDevicesUnder(mountPath string) (bool, error) {
+	output, err := common.ExecCommand("losetup", "-a")
+	if err != nil {
+		return false, status.Errorf(codes.Internal,
+			"could not list backing files for loop devices, %v", err)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, " ")
+		backingFile := strings.Trim(fields[len(fields)-1], ":()")
+		if strings.HasPrefix(backingFile, mountPath+"/") {
+			log.Infof("backing share, %s, still in use by, %s", mountPath, line)
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // mountLockFor returns the per-backing-directory lock that serializes the actual
@@ -499,22 +638,8 @@ func (d *CSIDriver) UnmountBackingShareIfUnused(ctx context.Context, backingShar
 	if isMounted := common.IsShareMounted(mountPath); !isMounted {
 		return true, nil
 	}
-	// If any loopback devices are using the mount
-	output, err := common.ExecCommand("losetup", "-a")
-	if err != nil {
-		return false, status.Errorf(codes.Internal,
-			"could not list backing files for loop devices, %v", err)
-	}
-	devices := strings.Split(string(output), "\n")
-	for _, d := range devices {
-		if d != "" {
-			device := strings.Split(d, " ")
-			backingFile := strings.Trim(device[len(device)-1], ":()")
-			if strings.Index(backingFile, mountPath) == 0 {
-				log.Infof("backing share, %s, still in use by, %s", mountPath, devices[0])
-				return false, nil
-			}
-		}
+	if inUse, err := backingFilesInUse(mountPath); err != nil || inUse {
+		return false, err
 	}
 
 	log.Infof("unmounting backing share %s", mountPath)

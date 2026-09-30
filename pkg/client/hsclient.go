@@ -136,24 +136,55 @@ func (client *HammerspaceClient) GetAnvilPortal() (string, error) {
 const portalCacheSeconds = 30
 
 // Return a string with a floating data portal IP
-func (client *HammerspaceClient) GetPortalFloatingIp(ctx context.Context) (string, error) {
-	// Instead of using /cntl, use /cntl/state to simplify processing of the JSON
-	// struct. If using /cntl, add [] before cluster struct
+// clusterState fetches /cntl/state. It is used instead of /cntl because it
+// returns a single cluster object rather than a list.
+func (client *HammerspaceClient) clusterState(ctx context.Context) (*common.Cluster, error) {
 	req, err := client.generateRequest(ctx, "GET", "/cntl/state", "")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	statusCode, respBody, _, err := client.doRequest(ctx, *req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if statusCode != 200 {
-		return "", fmt.Errorf(common.UnexpectedHSStatusCode, statusCode, 200)
+		return nil, fmt.Errorf(common.UnexpectedHSStatusCode, statusCode, 200)
 	}
 	var clusters common.Cluster
 	err = json.Unmarshal([]byte(respBody), &clusters)
 	if err != nil {
 		log.Error("Error parsing JSON response: " + err.Error())
+		return nil, err
+	}
+	return &clusters, nil
+}
+
+// NFSServerAddresses returns every address the driver may mount a share from:
+// the data portals that are up and all of the cluster's floating data-portal
+// IPs. A backing-share mount from any other server was made against a
+// different Anvil.
+func (client *HammerspaceClient) NFSServerAddresses(ctx context.Context) ([]string, error) {
+	portals, err := client.upDataPortals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	clusters, err := client.clusterState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]string, 0, len(portals)+len(clusters.PortalFloatingIps))
+	for _, p := range portals {
+		addresses = append(addresses, p.Node.MgmtIpAddress.Address)
+	}
+	for _, p := range clusters.PortalFloatingIps {
+		addresses = append(addresses, p.Address)
+	}
+	return addresses, nil
+}
+
+func (client *HammerspaceClient) GetPortalFloatingIp(ctx context.Context) (string, error) {
+	clusters, err := client.clusterState(ctx)
+	if err != nil {
 		return "", err
 	}
 
