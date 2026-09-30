@@ -65,7 +65,8 @@ def generate(args):
         "metadata": {"name": name, "annotations": annotations},
         "spec": {
             "displayName": "Hammerspace CSI Operator",
-            "description": "Manages Hammerspace CSI workloads for NFS, raw block, and ext4/xfs file-backed volumes. Install in hammerspace-csi. Requires an existing credentials Secret and Linux nodes with NFS and loop-device support. Development packaging; certification is a separate release gate.",
+            "description": "Manages Hammerspace CSI workloads for NFS, raw block, and ext4/xfs file-backed volumes. Install in hammerspace-csi. Requires an existing credentials Secret and Linux nodes with NFS and loop-device support."
+            + ("" if args.release else " Development packaging; certification is a separate release gate."),
             "version": args.version, "maturity": "alpha", "provider": {"name": "Hammerspace"},
             "minKubeVersion": "1.29.0",
             "installModes": [{"type": mode, "supported": mode == "OwnNamespace"} for mode in ["OwnNamespace", "SingleNamespace", "MultiNamespace", "AllNamespaces"]],
@@ -91,6 +92,9 @@ def generate(args):
         "operators.operatorframework.io.bundle.channels.v1": "alpha",
         "operators.operatorframework.io.bundle.channel.default.v1": "alpha",
     }
+    # Red Hat's certified-operators pipeline reads the OpenShift range from the bundle metadata.
+    if args.openshift_versions:
+        bundle_annotations["com.redhat.openshift.versions"] = args.openshift_versions
     (out / "metadata/annotations.yaml").write_text(yaml.safe_dump({"annotations": bundle_annotations}, sort_keys=False))
     labels = "\n".join("LABEL " + json.dumps(k) + "=" + json.dumps(v) for k, v in bundle_annotations.items())
     (out / "Dockerfile").write_text("FROM scratch\n" + labels + "\nCOPY manifests /manifests/\nCOPY metadata /metadata/\n")

@@ -88,6 +88,10 @@ class BundleTests(unittest.TestCase):
         csv = yaml.safe_load((self.args.output / "manifests/hammerspace-csi-operator.clusterserviceversion.yaml").read_text())
         self.assertEqual(csv["metadata"]["annotations"]["com.redhat.openshift.versions"], "v4.22")
         self.assertEqual(csv["metadata"]["annotations"]["features.operators.openshift.io/disconnected"], "true")
+        self.assertNotIn("Development packaging", csv["spec"]["description"])
+        metadata = yaml.safe_load((self.args.output / "metadata/annotations.yaml").read_text())
+        self.assertEqual(metadata["annotations"]["com.redhat.openshift.versions"], "v4.22")
+        self.assertIn('LABEL "com.redhat.openshift.versions"="v4.22"', (self.args.output / "Dockerfile").read_text())
 
     def test_release_accepts_digest_pinned_upstream_sidecars(self):
         self.args.release = True
