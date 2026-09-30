@@ -135,6 +135,8 @@ Variable                       |     Default           | Description
 *``HS_PASSWORD``               |                       | Hammerspace password
 ``HS_TLS_VERIFY``              |     ``false``         | Whether to validate the Hammerspace API gateway certificates
 ``CSI_MAJOR_VERSION``          |     ``"1"``           | CSI interface compatibility mode. Use ``"1"`` for Kubernetes 1.13+ deployments and ``"0"`` only for legacy Kubernetes 1.10-1.12 environments.
+``MAX_CONCURRENT_NFS_MOUNTS``  |     ``10``            | NFS mounts one plugin process runs at once, including the data-portal lookups before each mount. Mounts beyond this wait for the RPC's deadline and are then retried by kubelet, so a node reboot or drain stages volumes as a steady queue rather than all at once.
+``MAX_VOLUMES_PER_NODE``       |     ``0`` (no limit)  | Most volumes of this driver the scheduler places on one node, reported to Kubernetes in NodeGetInfo. Set it on the node plugin to the per-node count you have scale-tested; it applies after the node plugin restarts and re-registers.
 ``LOG_LEVEL``                  |     ``info``          | Log verbosity: ``panic``, ``fatal``, ``error``, ``warn``, ``info``, ``debug``, or ``trace``. ``debug`` logs every Anvil REST call, so use it for troubleshooting rather than steady-state operation. An unrecognized value falls back to ``info``.
 
 ## Usage

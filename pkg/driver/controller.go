@@ -359,7 +359,7 @@ func (d *CSIDriver) ensureShareBackedVolumeExists(ctx context.Context, hsVolume 
 	defer common.UnmountFilesystem(ctx, targetPath)
 
 	log.Debugf("Created empty folder with path %s", targetPath)
-	err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, hsVolume.FQDN)
+	err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, map[string]string{"fqdn": hsVolume.FQDN})
 	if err != nil {
 		log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 	} else {
@@ -416,7 +416,7 @@ func (d *CSIDriver) ensureBackingShareExists(ctx context.Context, backingShareNa
 		// generate unique target path on host for setting file metadata
 		targetPath := common.ShareStagingDir + "/metadata-mounts" + hsVolume.Path
 		defer common.UnmountFilesystem(ctx, targetPath)
-		err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, hsVolume.FQDN)
+		err = d.publishShareBackedVolume(ctx, hsVolume.Path, "", targetPath, hsVolume.MountFlags, false, map[string]string{"fqdn": hsVolume.FQDN})
 		if err != nil {
 			log.Warnf("failed to get share backed volume on hsVolumePath %s targetPath %s. Err %v", hsVolume.Path, targetPath, err)
 		}

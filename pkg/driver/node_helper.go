@@ -27,6 +27,9 @@ var (
 	mountFilesystem       = common.MountFilesystem
 	reconcileFilesystem   = common.ReconcileFilesystemToBackingFile
 	filesystemNeedsGrowth = common.FilesystemNeedsGrowth
+	isMountPoint          = common.SafeIsMountPoint
+	getNFSExports         = common.GetNFSExports
+	stageNFS              = (*CSIDriver).stageNFSVolume
 )
 
 // growFilesystemPrivatelyIfNeeded gives the driver a private writable
@@ -133,6 +136,14 @@ func nestedNFSSubPath(volumeID, backingExportPath string) (string, error) {
 	return subPath, nil
 }
 
+// stageNFSVolume mounts a native or nested NFS volume at its CSI staging path.
+func (d *CSIDriver) stageNFSVolume(ctx context.Context, volumeID, stagingTarget string, mountFlags []string, volumeContext map[string]string) error {
+	if backingShareName := volumeContext["mountBackingShareName"]; backingShareName != "" {
+		return d.stageNestedNFSVolume(ctx, backingShareName, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"])
+	}
+	return d.MountShareAtBestDataportal(ctx, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"])
+}
+
 // stageNestedNFSVolume mounts a nested NFS volume's own directory at the CSI
 // staging path, with the volume's mount options, exactly as a native NFS volume
 // is staged. It deliberately does not bind out of the node's shared backing
@@ -177,8 +188,8 @@ func nestedNFSMountFlags(mountFlags []string) []string {
 // publishShareBackedVolume publishes a native or nested NFS volume. With a
 // staging path it binds the volume's staged mount into the pod, read-only when
 // the publish asks for it.
-func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stagingTarget, targetPath string, mountFlags []string, readOnly bool, fqdn string) error {
-	mounted, err := common.SafeIsMountPoint(targetPath)
+func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stagingTarget, targetPath string, mountFlags []string, readOnly bool, volumeContext map[string]string) error {
+	mounted, err := isMountPoint(targetPath)
 	if err == nil && mounted {
 		log.Debugf("Volume (%s) already published at %s; nothing to do", volumeId, targetPath)
 		return nil
@@ -202,17 +213,30 @@ func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stag
 		// The share is mounted once at the CSI staging path. Publishing is a local
 		// bind per pod, while kubelet creates any subPath binds beneath that.
 		//
-		// Refuse to bind a staging path with nothing mounted on it. Binding it
+		// Never bind a staging path with nothing mounted on it. Binding it
 		// anyway hands the pod an empty directory on the node's own disk: every
 		// write succeeds, nothing reaches Hammerspace, and the data is lost when
-		// the pod moves. Failing here turns that silent data loss into an error
-		// kubelet retries and reports.
-		staged, checkErr := common.SafeIsMountPoint(stagingTarget)
+		// the pod moves.
+		//
+		// An empty staging path is expected after an upgrade from a driver that
+		// staged through the node-wide root export: kubelet treats the volume as
+		// staged for as long as any pod on the node uses it and won't call
+		// NodeStageVolume again, so a new pod would fail until every old pod had
+		// left the node. Stage the volume here instead, as NodeStageVolume now
+		// would. Old pods keep their binds from the root export, and
+		// NodeUnstageVolume releases that once the volume leaves the node.
+		staged, checkErr := isMountPoint(stagingTarget)
 		if checkErr != nil {
 			return status.Errorf(codes.Internal, "check staged NFS volume %s at %s: %v", volumeId, stagingTarget, checkErr)
 		}
 		if !staged {
-			return status.Errorf(codes.FailedPrecondition, "NFS volume %s is not mounted at staging path %s; refusing to publish an unbacked directory", volumeId, stagingTarget)
+			log.Warnf("NFS volume %s is not mounted at staging path %s; staging it before publishing", volumeId, stagingTarget)
+			if err := stageNFS(d, ctx, volumeId, stagingTarget, mountFlags, volumeContext); err != nil {
+				return err
+			}
+			if staged, checkErr = isMountPoint(stagingTarget); checkErr != nil || !staged {
+				return status.Errorf(codes.FailedPrecondition, "NFS volume %s is not mounted at staging path %s; refusing to publish an unbacked directory", volumeId, stagingTarget)
+			}
 		}
 		bind := func() error { return bindMountDevice(stagingTarget, targetPath) }
 		if readOnly {
@@ -228,7 +252,7 @@ func (d *CSIDriver) publishShareBackedVolume(ctx context.Context, volumeId, stag
 	if readOnly {
 		mountFlags = append(append([]string{}, mountFlags...), "ro")
 	}
-	return d.MountShareAtBestDataportal(ctx, volumeId, targetPath, mountFlags, fqdn)
+	return d.MountShareAtBestDataportal(ctx, volumeId, targetPath, mountFlags, volumeContext["fqdn"])
 }
 
 func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareName, volumePath, targetPath, fsType string, mountFlags []string, readOnly bool, fqdn string) error {

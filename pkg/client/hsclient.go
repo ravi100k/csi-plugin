@@ -129,6 +129,12 @@ func (client *HammerspaceClient) GetAnvilPortal() (string, error) {
 	return endpointUrl.Hostname(), nil
 }
 
+// portalCacheSeconds is how long the list of up data portals is reused. Every
+// NFS mount needs it, so without it a node staging many volumes at once asks
+// Anvil the same question once per volume. It is short enough that a portal
+// going down is noticed within one kubelet retry or two.
+const portalCacheSeconds = 30
+
 // Return a string with a floating data portal IP
 func (client *HammerspaceClient) GetPortalFloatingIp(ctx context.Context) (string, error) {
 	// Instead of using /cntl, use /cntl/state to simplify processing of the JSON
@@ -192,6 +198,37 @@ func (client *HammerspaceClient) GetPortalFloatingIp(ctx context.Context) (strin
 // GetDataPortals returns a list of operational data-portals
 // those with a matching nodeID are put at the top of the list
 func (client *HammerspaceClient) GetDataPortals(ctx context.Context, nodeID string) ([]common.DataPortal, error) {
+	filteredPortals, err := client.upDataPortals(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// sort dataportals
+	var colocatedPortals []common.DataPortal
+	var otherPortals []common.DataPortal
+	//// Find colocated node portals
+	for _, p := range filteredPortals {
+		if p.Node.Name == nodeID {
+			colocatedPortals = append(colocatedPortals, p)
+			log.Infof("Found co-located data-portal, %s, with node name, %s", p.Uoid["uuid"], p.Node.Name)
+		} else {
+			otherPortals = append(otherPortals, p)
+		}
+	}
+
+	sortedPortals := append(colocatedPortals, otherPortals...)
+
+	return sortedPortals, nil
+}
+
+// upDataPortals returns the NFS data portals that are up, reusing a list
+// fetched in the last portalCacheSeconds. Callers must not modify it.
+func (client *HammerspaceClient) upDataPortals(ctx context.Context) ([]common.DataPortal, error) {
+	if cached, _ := common.GetCacheData("DATA_PORTALS"); cached != nil {
+		if portals, ok := cached.([]common.DataPortal); ok {
+			return portals, nil
+		}
+	}
 	req, err := client.generateRequest(ctx, "GET", "/data-portals/", "")
 
 	if err != nil {
@@ -224,22 +261,8 @@ func (client *HammerspaceClient) GetDataPortals(ctx context.Context, nodeID stri
 		}
 	}
 
-	// sort dataportals
-	var colocatedPortals []common.DataPortal
-	var otherPortals []common.DataPortal
-	//// Find colocated node portals
-	for _, p := range filteredPortals {
-		if p.Node.Name == nodeID {
-			colocatedPortals = append(colocatedPortals, p)
-			log.Infof("Found co-located data-portal, %s, with node name, %s", p.Uoid["uuid"], p.Node.Name)
-		} else {
-			otherPortals = append(otherPortals, p)
-		}
-	}
-
-	sortedPortals := append(colocatedPortals, otherPortals...)
-
-	return sortedPortals, nil
+	common.SetCacheData("DATA_PORTALS", filteredPortals, portalCacheSeconds)
+	return filteredPortals, nil
 }
 
 // Logs into Hammerspace Anvil Server

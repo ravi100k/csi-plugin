@@ -537,6 +537,47 @@ func (d *CSIDriver) MountShareAtBestDataportal(ctx context.Context, shareExportP
 	return d.mountShareSubPathAtBestDataportal(ctx, shareExportPath, "", targetPath, mountFlags, fqdn)
 }
 
+// nfsExportsCacheSeconds is how long a data portal's export list is reused.
+const nfsExportsCacheSeconds = 30
+
+// cachedNFSExports returns the exports of the data portal at addr, reusing a
+// list fetched in the last nfsExportsCacheSeconds, and reports whether it came
+// from the cache. Staging many volumes at once would otherwise run showmount
+// against the same portal once per volume. fresh skips the cache.
+func cachedNFSExports(addr string, fresh bool) ([]string, bool, error) {
+	key := "NFS_EXPORTS:" + addr
+	if !fresh {
+		if cached, _ := common.GetCacheData(key); cached != nil {
+			if exports, ok := cached.([]string); ok {
+				return exports, true, nil
+			}
+		}
+	}
+	exports, err := getNFSExports(addr)
+	if err != nil {
+		return nil, false, err
+	}
+	common.SetCacheData(key, exports, nfsExportsCacheSeconds)
+	// DeleteFile refuses to remove a path in this list.
+	common.SetCacheData("NFS_EXPORTS", exports, 60*60)
+	return exports, false, nil
+}
+
+// matchNFSExport returns the mount source for subPath inside the share at
+// shareExportPath, or "" when no export under a known prefix matches.
+func matchNFSExport(exports []string, addr, shareExportPath, subPath string) string {
+	for _, mountPrefix := range common.DefaultDataPortalMountPrefixes {
+		for _, e := range exports {
+			if e == fmt.Sprintf("%s%s", mountPrefix, shareExportPath) {
+				export := fmt.Sprintf("%s:%s%s%s", addr, mountPrefix, shareExportPath, subPath)
+				log.Debugf("Found export %s", export)
+				return export
+			}
+		}
+	}
+	return ""
+}
+
 // mountShareSubPathAtBestDataportal mounts subPath, a directory inside the share
 // exported at shareExportPath, rather than the share's root. The portal is
 // selected by matching shareExportPath against its export list, since a
@@ -547,6 +588,15 @@ func (d *CSIDriver) mountShareSubPathAtBestDataportal(ctx context.Context, share
 	var fipaddr string = ""
 
 	log.Debugf("Finding best host exporting %s (mounting %q inside it)", shareExportPath, subPath)
+
+	// Hold a mount slot across portal selection as well as the mount itself:
+	// the Anvil and showmount calls are most of the load a burst of mounts puts
+	// on the cluster.
+	releaseSlot, err := d.acquireMountSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
 
 	portals, err := d.hsclient.GetDataPortals(ctx, d.NodeID)
 	if err != nil {
@@ -594,6 +644,11 @@ func (d *CSIDriver) mountShareSubPathAtBestDataportal(ctx context.Context, share
 	}
 
 	MountToDataPortal := func(portal common.DataPortal, mount_options []string) bool {
+		// Kubelet has given up on this RPC and will retry it. Stop walking the
+		// portal list so the retry doesn't queue behind this attempt's slot.
+		if ctx.Err() != nil {
+			return false
+		}
 		addr := ""
 		if len(fipaddr) > 0 {
 			addr = fipaddr
@@ -607,26 +662,18 @@ func (d *CSIDriver) mountShareSubPathAtBestDataportal(ctx context.Context, share
 			export = fmt.Sprintf("%s:%s%s%s", addr, common.DataPortalMountPrefix, shareExportPath, subPath)
 		} else {
 			// grab exports with showmount
-			exports, err := common.GetNFSExports(addr)
-			common.SetCacheData("NFS_EXPORTS", exports, 60*60) // keep the exports for an our before auto expire
+			exports, cached, err := cachedNFSExports(addr, false)
 			if err != nil {
 				log.Debugf("Could not get exports for data-portal at %s, %s. Error: %v", addr, portal.Uoid["uuid"], err)
 				return false
 			}
 			log.Debugf("Found exports for data-portal %s, %v", addr, exports)
 
-			// Check configured prefix
-			// Check the default prefixes
-			for _, mountPrefix := range common.DefaultDataPortalMountPrefixes {
-				for _, e := range exports {
-					if e == fmt.Sprintf("%s%s", mountPrefix, shareExportPath) {
-						export = fmt.Sprintf("%s:%s%s%s", addr, mountPrefix, shareExportPath, subPath)
-						log.Debugf("Found export %s", export)
-						break
-					}
-				}
-				if export != "" {
-					break
+			export = matchNFSExport(exports, addr, shareExportPath, subPath)
+			if export == "" && cached {
+				// The share may be newer than the cached list.
+				if exports, _, err = cachedNFSExports(addr, true); err == nil {
+					export = matchNFSExport(exports, addr, shareExportPath, subPath)
 				}
 			}
 			if export == "" {

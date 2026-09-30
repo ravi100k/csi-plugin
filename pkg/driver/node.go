@@ -21,7 +21,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"context"
@@ -39,10 +41,76 @@ import (
 // failures (notably EIO from a shut-down XFS mount) can be regression tested.
 var (
 	statVolumePath     = os.Stat
+	statfsVolumePath   = syscall.Statfs
 	lstatTargetPath    = os.Lstat
 	forceUnmountTarget = common.ForceUnmountFilesystem
 	filesystemType     = common.GetFilesystemType
+	// volumeStatsTimeout bounds NodeGetVolumeStats' stat and statfs of the
+	// volume path, which never return on a hard NFS mount whose server is gone.
+	volumeStatsTimeout = 10 * time.Second
 )
+
+// maxVolumesPerNode reads MAX_VOLUMES_PER_NODE, the most volumes of this
+// driver the scheduler may place on one node. Zero or unset means no limit.
+func maxVolumesPerNode() int64 {
+	value := os.Getenv("MAX_VOLUMES_PER_NODE")
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < 0 {
+		log.Warnf("Invalid MAX_VOLUMES_PER_NODE=%q; not limiting volumes per node", value)
+		return 0
+	}
+	return n
+}
+
+// volumePathProbe is one stat, and for a non-block path one statfs, of a
+// volume path.
+type volumePathProbe struct {
+	done      chan struct{}
+	info      os.FileInfo
+	statErr   error
+	statfs    syscall.Statfs_t
+	statfsErr error
+}
+
+var (
+	volumePathProbesMu sync.Mutex
+	volumePathProbes   = map[string]*volumePathProbe{}
+)
+
+// probeVolumePath stats path, and statfs's it unless it is a block device,
+// giving up after timeout. A probe stuck on a dead NFS mount cannot be
+// cancelled, so a later call for the same path waits on that probe instead of
+// starting another: kubelet asks for stats every minute, and would otherwise
+// leave one more stuck goroutine behind each time.
+func probeVolumePath(path string, timeout time.Duration) (*volumePathProbe, bool) {
+	volumePathProbesMu.Lock()
+	probe, ok := volumePathProbes[path]
+	if !ok {
+		probe = &volumePathProbe{done: make(chan struct{})}
+		volumePathProbes[path] = probe
+		go func() {
+			probe.info, probe.statErr = statVolumePath(path)
+			if probe.statErr == nil && !IsBlockDevice(probe.info) {
+				probe.statfsErr = statfsVolumePath(path, &probe.statfs)
+			}
+			volumePathProbesMu.Lock()
+			delete(volumePathProbes, path)
+			volumePathProbesMu.Unlock()
+			close(probe.done)
+		}()
+	}
+	volumePathProbesMu.Unlock()
+
+	select {
+	case <-probe.done:
+		return probe, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
 
 func (d *CSIDriver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 
@@ -66,7 +134,8 @@ func (d *CSIDriver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest
 	}
 
 	csiNodeResponse := &csi.NodeGetInfoResponse{
-		NodeId: d.NodeID,
+		NodeId:            d.NodeID,
+		MaxVolumesPerNode: maxVolumesPerNode(),
 		AccessibleTopology: &csi.Topology{
 			Segments: map[string]string{
 				common.TopologyKeyDataPortal: strconv.FormatBool(isDataPortal),
@@ -91,7 +160,14 @@ func (d *CSIDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolu
 	}
 
 	// Check if path exists
-	info, err := statVolumePath(req.GetVolumePath())
+	probe, answered := probeVolumePath(req.GetVolumePath(), volumeStatsTimeout)
+	if !answered {
+		log.Errorf("volume path %s did not answer stat within %s", req.GetVolumePath(), volumeStatsTimeout)
+		return nil, status.Errorf(codes.Unavailable,
+			"volume path %s did not answer within %s; its NFS server may be unreachable",
+			req.GetVolumePath(), volumeStatsTimeout)
+	}
+	info, err := probe.info, probe.statErr
 	if err != nil {
 		if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
 			log.Errorf("volume path is inaccessible due to an I/O error: %s, err: %v", req.GetVolumePath(), err)
@@ -140,8 +216,7 @@ func (d *CSIDriver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolu
 	}
 
 	// Default: File or NFS mount — use Statfs
-	var st syscall.Statfs_t
-	err = syscall.Statfs(req.GetVolumePath(), &st)
+	st, err := probe.statfs, probe.statfsErr
 	if err != nil {
 		log.Errorf("statfs failed on %s: %v", req.GetVolumePath(), err)
 		return nil, status.Error(codes.Internal, common.FileNotFound)
@@ -234,11 +309,7 @@ func (d *CSIDriver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 	// gets its own mount of that directory, not a bind out of the node's shared
 	// backing-share mount.
 	if fsType == "nfs" {
-		if backingShareName := volumeContext["mountBackingShareName"]; backingShareName != "" {
-			if err := d.stageNestedNFSVolume(ctx, backingShareName, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
-				return nil, err
-			}
-		} else if err := d.MountShareAtBestDataportal(ctx, volumeID, stagingTarget, mountFlags, volumeContext["fqdn"]); err != nil {
+		if err := stageNFS(d, ctx, volumeID, stagingTarget, mountFlags, volumeContext); err != nil {
 			return nil, err
 		}
 		log.Infof("Staged NFS volume %s at %s", volumeID, stagingTarget)
@@ -270,45 +341,53 @@ func (d *CSIDriver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageV
 
 	// Native NFS volumes have a real mount at the CSI staging path. Other volume
 	// types leave it empty.
-	mounted, mountErr := common.SafeIsMountPoint(stagingTarget)
+	mounted, mountErr := isMountPoint(stagingTarget)
 	if mountErr == nil && mounted {
-		if err := common.UnmountFilesystem(ctx, stagingTarget); err != nil {
+		if err := unmountFilesystem(ctx, stagingTarget); err != nil {
 			return nil, status.Errorf(codes.Internal, "unmount NFS staging target: %v", err)
 		}
-		return &csi.NodeUnstageVolumeResponse{}, nil
-	}
-	if errors.Is(mountErr, syscall.EIO) || errors.Is(mountErr, syscall.ESTALE) {
+	} else if errors.Is(mountErr, syscall.EIO) || errors.Is(mountErr, syscall.ESTALE) {
 		if err := forceUnmountTarget(stagingTarget); err != nil {
 			return nil, status.Errorf(codes.Internal, "force-unmount stale NFS staging target: %v", err)
 		}
-		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
-	// Upgrade cleanup. Driver versions before the staged-NFS design mounted a
-	// node-wide root export at stage time and wrote a marker per staged volume.
-	// This driver no longer writes markers, so a marker here belongs to a volume
-	// staged by an older version: drop it, and unmount the root export once the
-	// last such volume is gone.
+	// A volume staged by an older driver may also have been staged again by
+	// NodePublishVolume after the upgrade, so release its root-export
+	// reference whether or not the staging path was mounted.
+	if err := d.releaseLegacyRootExport(ctx, volumeID); err != nil {
+		return nil, err
+	}
+	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// releaseLegacyRootExport drops volumeID's reference to the node-wide root
+// export. Driver versions before the staged-NFS design mounted that export at
+// stage time and wrote a marker per staged volume. This driver no longer
+// writes markers, so a marker here belongs to a volume staged by an older
+// version: drop it, and unmount the root export once the last such volume is
+// gone.
+func (d *CSIDriver) releaseLegacyRootExport(ctx context.Context, volumeID string) error {
 	marker := GetHashedMarkerPath(common.BaseVolumeMarkerSourcePath, volumeID)
 	if _, statErr := os.Stat(marker); os.IsNotExist(statErr) {
-		return &csi.NodeUnstageVolumeResponse{}, nil
+		return nil
 	}
 
 	unlock, lockErr := d.acquireRootMountLock(ctx)
 	if lockErr != nil {
-		return nil, lockErr
+		return lockErr
 	}
 	defer unlock()
 
 	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-		return nil, status.Errorf(codes.Internal, "remove volume marker %s: %v", marker, err)
+		return status.Errorf(codes.Internal, "remove volume marker %s: %v", marker, err)
 	}
 	if !IsAnyVolumeStillMounted(common.BaseVolumeMarkerSourcePath) {
-		if err := common.UnmountFilesystem(ctx, common.BaseBackingShareMountPath); err != nil {
-			return nil, status.Errorf(codes.Internal, "unmount root export: %v", err)
+		if err := unmountFilesystem(ctx, common.BaseBackingShareMountPath); err != nil {
+			return status.Errorf(codes.Internal, "unmount root export: %v", err)
 		}
 	}
-	return &csi.NodeUnstageVolumeResponse{}, nil
+	return nil
 }
 
 func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (_ *csi.NodePublishVolumeResponse, err error) {
@@ -374,7 +453,7 @@ func (d *CSIDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 			"Volume_id":         volume_id,
 			"Traget Path":       targetPath,
 		}).Info("Starting node publish volume for NFS volume.")
-		err := d.publishShareBackedVolume(ctx, volume_id, req.GetStagingTargetPath(), targetPath, mountFlags, readOnly, volumeContext["fqdn"])
+		err := d.publishShareBackedVolume(ctx, volume_id, req.GetStagingTargetPath(), targetPath, mountFlags, readOnly, volumeContext)
 		if err != nil {
 			return nil, err
 		}
