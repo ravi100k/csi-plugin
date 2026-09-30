@@ -157,8 +157,8 @@ With Python 3 and PyYAML, supply the image references you built:
 
 ```sh
 python3 hack/build_bundle.py \
-  --operator-image YOUR_REGISTRY/hammerspace-csi-operator:0.1.0 \
-  --bundle-image YOUR_REGISTRY/hammerspace-csi-operator-bundle:0.1.0
+  --operator-image YOUR_REGISTRY/hammerspace-csi-operator:0.1.1 \
+  --bundle-image YOUR_REGISTRY/hammerspace-csi-operator-bundle:0.1.1
 ```
 
 This creates ignored `bundle/` containing the CSV, CRD, annotations, bundle
