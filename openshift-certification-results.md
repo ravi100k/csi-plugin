@@ -77,18 +77,112 @@ mount.
 
 For a file subPath, kubelet opens the file and then runs
 `mount --bind /proc/<pid>/fd/N <target>`. Under the old design that bind failed
-with `ESTALE` (`failed to prepare subPath for volumeMount`). Directory subPaths,
-which kubelet prepares differently, passed.
+with `ESTALE` (`failed to prepare subPath for volumeMount`). Directory subPaths
+go through the same bind and passed.
 
-What was established:
-- `ESTALE` appeared only when the volume was reached through a root-export
-  junction.
-- It disappeared when the share was mounted directly.
+**Root cause (found 2026-09-29): on the Anvil over NFS 4.2, the mount that
+creates a file caches it with a link count of 0.** The junction submount is not
+involved. The Linux client treats a zero-link file as deleted, and kubelet's
+bind trips over that. The server can send a 0 link count (confirmed in the
+server source, below). Why this only shows up over 4.2 is not yet known.
 
-The exact kernel mechanism was not isolated. The main suspect: junction
-submounts are shrinkable automounts
-(`/proc/sys/fs/nfs/nfs_mountpoint_timeout=500`), so the dentry the file
-descriptor points into can be invalidated underneath kubelet.
+1. The old root mount went to the Anvil IP over NFS 4.2
+   (`EnsureRootExportMounted`, removed in 36a2bb0).
+2. After a file is created over 4.2, the creating mount reports
+   `nlink = 0` for it, both by name and by file handle, even with `noac`. In
+   one run it was still 0 at 391s and 1 a few seconds later. At the same
+   moment, a second 4.2 mount on the same host, which hadn't created the file,
+   saw `nlink = 1`. Over NFS 4.1 the creating mount sees 1 immediately.
+3. The Linux NFS client treats a cached inode with `nlink == 0` as deleted.
+   Reaching a file through a `/proc/<pid>/fd/N` link makes the kernel verify
+   the inode (`nfs_lookup_verify_inode`), and that returns `ESTALE` for a
+   zero-link inode. A normal open by path skips this check, so the pod itself
+   sees nothing wrong.
+4. Directories never have a zero link count, which is why directory subPaths
+   passed. The e2e test creates the file and mounts it as a subPath within
+   seconds, so it failed every time.
+
+Both mounts share one NFS client identity, so the server can't tell their
+requests apart. The zero therefore most likely reaches the creating mount in
+a reply tied to the create, and that mount keeps it, probably because it holds
+a delegation on the file. That would also fit the zero clearing after several
+minutes. This is inference: no packet capture or server trace has shown which
+reply carries the 0.
+
+Per-volume staging mounts through the data portals, not the Anvil, and passed
+the full run. Whether the portals simply never send a 0 link count hasn't been
+checked.
+
+**How it was reproduced:** on a dev host (kernel 5.15), outside Kubernetes,
+against Anvil `10.200.104.20` and `share1`, using kubelet's exact sequence
+(`openat(O_PATH|O_NOFOLLOW)` one path component at a time, then
+`mount --no-canonicalize -o bind /proc/<pid>/fd/N <target>`):
+
+| Case | Result |
+| --- | --- |
+| Old file, through the root mount (4.2) | works |
+| Directory, through or inside the junction | works |
+| New file, through the junction (4.2) | `ESTALE` |
+| New file, direct mount of the share with its own superblock (4.2, no junction) | `ESTALE` |
+| Same new file, from a second 4.2 mount that didn't create it | works, `nlink=1` |
+| New file, direct mount over 4.1 | works, `nlink=1` |
+| New file, root mount through the junction over 4.1 | works |
+| New file over 4.2 with `noac`, from the creating mount | `nlink=0`, by name and by file handle |
+
+During a failing bind, the NFS per-operation counters showed the GETATTR
+succeeding with no error, and `rpcdebug` reported "revalidation complete". So
+the server doesn't return an error; the client rejects the file because of the
+link count it holds. The Anvil doesn't serve NFSv3, so v3 wasn't tested.
+
+**Server source review (protod = NFS front end, pdfs = metadata engine):**
+- **protod passes the link count through unchecked.** `protod/lib/ns/attr.c:1152`
+  sets `dst->numlinks = src->fa_num_links` without checking whether pdfs
+  filled the value in.
+- **The 0→1 safeguard was removed.** Commit `2d25d30883a` (2015, "Remove a
+  misleading warning on the number of links") removed a check that logged a
+  zero and replaced it with 1.
+- **pdfs fills in the count only when it locks the inode.**
+  `pdfs/src/fs/pdfs.c:3505` starts from `fa_num_links = i_nsubdir`, which is
+  always 0 for a regular file. Only the locked branch
+  (`pdfs/src/fs/inode.c:2780-2782`) adds `inode_nparents()`. With `LK_NONE`,
+  pdfs sets neither the count nor its mask bit, and protod still encodes the
+  0. READDIR takes this unlocked path when it can't lock an entry's inode
+  (`pdfs.c:13563`).
+- **A stale unit test still expects the safeguard.**
+  `protod/lib/ns/tests/attr.c:98` asserts that a zero `fa_num_links` copies
+  out as 1. It was a bare `assert()` until `a1b4ecaf285` (2026-09-06), so it
+  probably never ran in release builds, and it likely fails now.
+- **Nothing ties this to 4.2.** The server checks the minor version only to
+  accept 1 or 2 (`compound.c:2077`), for callbacks, and in the reqscope code,
+  which is switched off. The only 4.2-specific input is the security label a
+  4.2 client asks for in GETATTR (`FATTR4_SEC_LABEL`); no link-count effect
+  was found there. The create path sets `fa_num_links = 1`
+  (`pdfs.c:9269`), and the normal GETATTR path locks the inode.
+
+The earlier suspect, junction automounts expiring
+(`nfs_mountpoint_timeout=500`), was wrong. Why `lookupcache=none`/`pos` passed
+targeted runs but not full runs wasn't investigated.
+
+**Still open:**
+- **Hammerspace bug report.** protod sends `fa_num_links` even when pdfs
+  didn't fill it in, and the 0→1 safeguard is gone. Restoring a mask check or
+  the safeguard in `pdfs_ns_attr_copy` would fix the symptom for every client
+  version. Include the stale unit test.
+- **Which operation sends the 0, and why only over 4.2.** It could be what
+  the 4.2 client requests on OPEN-create, a delegation, or a server path not
+  yet traced. The server's LTTng tracepoints can show it without a packet
+  capture: `nfs4-tp.h:350` traces `numlinks` in replies, and `core-tp.h`
+  traces `fa_num_links` in the inode cache. Client-side repro: mount the Anvil
+  with `vers=4.2,noac`, create a file, and `stat` it from the same mount: it
+  shows `Links: 0`. With `vers=4.1` it shows 1.
+- **Remaining exposure.** Until the server is fixed, any 4.2 mount to the
+  Anvil is exposed, including per-volume staging when a StorageClass `fqdn`
+  resolves to the Anvil. Which server and NFS version the staged mounts
+  actually use on the cluster hasn't been confirmed.
+- **A root mount over 4.1** avoided the bug in these tests, but check
+  byte-range locking on the Anvil's 4.1 export first. A data portal's 4.1
+  export is known not to support byte-range locks (see the NFS 4.1 comment in
+  `mountShareSubPathAtBestDataportal`).
 
 ### What was tried first
 
@@ -495,10 +589,11 @@ failed to prepare subPath for volumeMount "test-volume" of container
 "test-container-subpath-dynamicpv-..."  reason: CreateContainerConfigError
 ```
 
-The previously root-caused ESTALE case: each volume is already a nested NFS
-submount inside the shared root mount, `publishShareBackedVolume` bind-mounts it a
-second time, and kubelet's own fd bind-mount adds a third layer. Fully
-reproducible, not a race.
+The ESTALE case explained under "Why file subPaths failed" above: the old root
+mount went to the Anvil over NFS 4.2, the creating mount ends up with a link
+count of 0 for a new file, and kubelet's `/proc/<pid>/fd` bind of the file fails.
+Fully reproducible, not a race. (This was first blamed on the nested
+submount-and-bind layering; that was wrong.)
 
 ### 4. Mount options (`noatime`) — NFS
 

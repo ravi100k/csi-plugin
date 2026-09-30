@@ -18,15 +18,24 @@ Unit tests: `go test ./pkg/...` passes. `go vet` and `gofmt` are clean.
 | `NodePublishVolume` | Bind-mounted `rootmount/<share>/` (an NFS junction submount) into the pod | Bind-mounts the staging path into the pod, and refuses if nothing is mounted there (see 2) |
 | `NodeUnstageVolume` | Removed the marker, then unmounted the root export when no markers were left | Unmounts the staging path, and force-detaches it if it returns `EIO`/`ESTALE` |
 
-**Why:** kubelet's file-subPath preparation failed with `ESTALE` whenever the
-volume was reached through a root-export junction. Two certification tests
-failed in every full run under the old design:
+**Why:** kubelet's file-subPath preparation failed with `ESTALE` under the
+old design. The old root mount went to the Anvil over NFS 4.2. For several
+minutes after a pod creates a file, the creating mount holds it with a link
+count of 0, and the Linux client refuses a zero-link file reached through
+kubelet's `/proc/<pid>/fd` bind. The server can send a 0 link count (protod
+passes pdfs's value through unchecked; the old 0→1 safeguard was removed in
+2015). Why it only happens over 4.2 is still open. The junction itself was not the cause (root-caused
+2026-09-29; details and repro in `openshift-certification-results.md`, "Why
+file subPaths failed"). Two certification tests failed in every full run under
+the old design:
 - `subPath should support file as subpath`
 - `subPath should support readOnly file specified in the volumeMount`
 
 Several narrower fixes were tried first and each failed; the results document
-lists them. With a direct per-volume mount, all 16 subPath tests pass in a full
-run and no `ESTALE` appears.
+lists them. With a direct per-volume mount through the data portals, all 16
+subPath tests pass in a full run and no `ESTALE` appears. The Anvil 4.2 bug is
+still there; a per-volume mount that goes to the Anvil over 4.2 (for example
+through a StorageClass `fqdn` that resolves to it) would hit it again.
 
 **What this costs:**
 - **More NFS mounts:** one NFS mount per volume per node instead of one per node.
