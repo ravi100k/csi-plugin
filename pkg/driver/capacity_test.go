@@ -9,6 +9,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/hammer-space/csi-plugin/pkg/client"
+	"github.com/hammer-space/csi-plugin/pkg/common"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -30,6 +31,8 @@ func TestGetCapacityUsesStorageClassParameters(t *testing.T) {
 		{name: "backing API failure", params: map[string]string{"blockBackingShareName": "block-share"}, share: "block-share", shareStatus: 500, wantCode: codes.Internal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Subtests reuse share names; start each without a cached figure.
+			common.SetCacheData("BACKING_SHARE_FREE:"+tc.share, nil, 60)
 			shareCalls := 0
 			mux := http.NewServeMux()
 			mux.HandleFunc(client.BasePath+"/login", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
@@ -66,5 +69,48 @@ func TestGetCapacityUsesStorageClassParameters(t *testing.T) {
 				t.Fatalf("backing share queries = %d, want 1", shareCalls)
 			}
 		})
+	}
+}
+
+// The provisioner refreshes capacity for every StorageClass in turn, so a
+// backing share lookup stuck on a slow Anvil held up every other class. Its
+// free space is reused for a while; a missing share is not cached.
+func TestGetCapacityReusesBackingShareFreeSpace(t *testing.T) {
+	common.SetCacheData("BACKING_SHARE_FREE:cached-share", nil, 60)
+	common.SetCacheData("BACKING_SHARE_FREE:new-share", nil, 60)
+	calls := map[string]int{}
+	mux := http.NewServeMux()
+	mux.HandleFunc(client.BasePath+"/login", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc(client.BasePath+"/cntl/state", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"capacity":{"free":8192}}`) })
+	mux.HandleFunc(client.BasePath+"/shares/", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path[len(client.BasePath+"/shares/"):]
+		calls[name]++
+		if name == "new-share" {
+			w.WriteHeader(404)
+			return
+		}
+		fmt.Fprint(w, `{"space":{"available":4096}}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	hs, err := client.NewHammerspaceClient(server.URL, "test", "test", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &CSIDriver{hsclient: hs}
+
+	for i := 0; i < 3; i++ {
+		for _, share := range []string{"cached-share", "new-share"} {
+			req := &csi.GetCapacityRequest{Parameters: map[string]string{"blockBackingShareName": share}}
+			if _, err := driver.GetCapacity(context.Background(), req); err != nil {
+				t.Fatalf("GetCapacity(%s): %v", share, err)
+			}
+		}
+	}
+	if calls["cached-share"] != 1 {
+		t.Errorf("existing backing share queried %d times, want 1", calls["cached-share"])
+	}
+	if calls["new-share"] != 3 {
+		t.Errorf("missing backing share queried %d times, want 3 so its creation is noticed", calls["new-share"])
 	}
 }

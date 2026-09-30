@@ -135,10 +135,21 @@ func (client *HammerspaceClient) GetAnvilPortal() (string, error) {
 // going down is noticed within one kubelet retry or two.
 const portalCacheSeconds = 30
 
-// Return a string with a floating data portal IP
-// clusterState fetches /cntl/state. It is used instead of /cntl because it
-// returns a single cluster object rather than a list.
+// clusterStateCacheSeconds is how long /cntl/state is reused for floating IP
+// lookups. Every NFS mount looks up the floating IPs, so without it a node
+// staging many volumes asks Anvil for the full cluster state once per volume,
+// and while Anvil is slow every mount waits on that call.
+const clusterStateCacheSeconds = 30
+
+// clusterState fetches /cntl/state, reusing a copy fetched in the last
+// clusterStateCacheSeconds. It is used instead of /cntl because it returns a
+// single cluster object rather than a list. Callers must not modify it.
 func (client *HammerspaceClient) clusterState(ctx context.Context) (*common.Cluster, error) {
+	if cached, _ := common.GetCacheData("CLUSTER_STATE"); cached != nil {
+		if clusters, ok := cached.(*common.Cluster); ok {
+			return clusters, nil
+		}
+	}
 	req, err := client.generateRequest(ctx, "GET", "/cntl/state", "")
 	if err != nil {
 		return nil, err
@@ -156,6 +167,7 @@ func (client *HammerspaceClient) clusterState(ctx context.Context) (*common.Clus
 		log.Error("Error parsing JSON response: " + err.Error())
 		return nil, err
 	}
+	common.SetCacheData("CLUSTER_STATE", &clusters, clusterStateCacheSeconds)
 	return &clusters, nil
 }
 
@@ -834,6 +846,19 @@ func (client *HammerspaceClient) CreateShare(ctx context.Context,
 	}
 	if statusCode != 202 {
 		if statusCode == 400 {
+			// A retry of a create Anvil has already queued: wait on that task
+			// instead of listing every task on the cluster to find it.
+			if id := runningTaskID(respBody, "share-create"); id != "" {
+				log.Infof("share-create for %s is already queued as task %s; waiting on it", name, id)
+				success, err := client.WaitForTaskCompletion(ctx, "/tasks/"+id)
+				if err != nil {
+					return status.Errorf(codes.Aborted, "share-create task %s for %s has not finished: %v", id, name, err)
+				}
+				if !success {
+					return errors.New("share failed to create")
+				}
+				return nil
+			}
 			shareTaskRunning, taskErr := client.CheckIfShareCreateTaskIsRunning(ctx, name)
 			if taskErr != nil {
 				return taskErr
@@ -1103,6 +1128,17 @@ func (client *HammerspaceClient) DeleteShare(ctx context.Context, name string, d
 		if strings.Contains(body, "Cannot remove a share with state REMOVED.") {
 			return nil
 		}
+		// A retry of a delete Anvil has already queued. Wait on that task:
+		// failing here made the provisioner retry, and send another DELETE,
+		// every few seconds until Anvil got to the first one.
+		if id := runningTaskID(body, "share-delete"); id != "" {
+			log.Infof("share-delete for %s is already queued as task %s; waiting on it", name, id)
+			return client.waitForShareDelete(ctx, "/tasks/"+id)
+		}
+		// The share is still being created, or another task holds it.
+		if strings.Contains(body, "BUSY") {
+			return status.Errorf(codes.Unavailable, "share %s is busy with another task: %s", name, body)
+		}
 	}
 	if statusCode == 404 || statusCode == 200 {
 		return nil
@@ -1111,22 +1147,42 @@ func (client *HammerspaceClient) DeleteShare(ctx context.Context, name string, d
 		return fmt.Errorf(common.UnexpectedHSStatusCode, statusCode, 202)
 	}
 
-	// ensure the location header is set and also make sure length >= 1
-	if locs, exists := respHeaders["Location"]; exists {
-		if !exists {
-			log.Errorf("No task returned to monitor")
-		} else {
-			success, err := client.WaitForTaskCompletion(ctx, locs[0])
-			if err != nil {
-				log.Error(err)
-			}
-			if !success {
-				return errors.New("share-delete task failed")
-			}
+	if locs, exists := respHeaders["Location"]; exists && len(locs) > 0 {
+		return client.waitForShareDelete(ctx, locs[0])
+	}
+	log.Errorf("No task returned to monitor")
+	return nil
+}
+
+// runningTaskRe matches Anvil's 400 for a request whose task is already
+// queued or running, e.g. "Task 'share-delete' is already running with ID
+// '<uuid>' and Status 'VALIDATED'".
+var runningTaskRe = regexp.MustCompile(`Task '([a-z-]+)' is already running with ID '([0-9A-Fa-f-]+)'`)
+
+// runningTaskID returns the ID of the action task that a 400 response body
+// reports as already running, or "".
+func runningTaskID(body, action string) string {
+	for _, m := range runningTaskRe.FindAllStringSubmatch(body, -1) {
+		if m[1] == action {
+			return m[2]
 		}
 	}
+	return ""
+}
 
-	return nil
+// waitForShareDelete waits for a share-delete task. If it can't see the task
+// finish, because the RPC ran out of time or Anvil didn't answer, it returns
+// Aborted rather than a failed delete: the task is still queued on Anvil, and
+// the provisioner's retry waits on it again.
+func (client *HammerspaceClient) waitForShareDelete(ctx context.Context, taskLocation string) error {
+	success, err := client.WaitForTaskCompletion(ctx, taskLocation)
+	if success {
+		return nil
+	}
+	if err != nil {
+		return status.Errorf(codes.Aborted, "share-delete task %s has not finished: %v", path.Base(taskLocation), err)
+	}
+	return errors.New("share-delete task failed")
 }
 
 func (client *HammerspaceClient) SnapshotShare(ctx context.Context, shareName string) (string, error) {

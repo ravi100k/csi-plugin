@@ -348,7 +348,7 @@ func (d *CSIDriver) ensureShareBackedVolumeExists(ctx context.Context, hsVolume 
 		)
 
 		if err != nil {
-			return status.Errorf(codes.Internal, "%s", err.Error())
+			return hsError(err)
 		}
 	}
 	// generate unique target path on host for setting file metadata
@@ -402,7 +402,7 @@ func (d *CSIDriver) ensureBackingShareExists(ctx context.Context, backingShareNa
 			hsVolume.Comment,
 		)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%s", err.Error())
+			return nil, hsError(err)
 		}
 		share, err = d.hsclient.GetShare(ctx, backingShareName)
 		if err != nil {
@@ -1097,9 +1097,19 @@ func (d *CSIDriver) deleteShareBackedVolume(ctx context.Context, share *common.S
 	}
 	err = d.hsclient.DeleteShare(ctx, share.Name, deleteDelay)
 	if err != nil {
-		return status.Errorf(codes.Internal, "%s", err.Error())
+		return hsError(err)
 	}
 	return nil
+}
+
+// hsError returns err as a gRPC error. A code the Hammerspace client already
+// chose is kept, such as Aborted for a task Anvil is still working on, so the
+// provisioner retries it as pending; anything else is Internal.
+func hsError(err error) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Errorf(codes.Internal, "%s", err.Error())
 }
 
 func (d *CSIDriver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (_ *csi.DeleteVolumeResponse, err error) {
@@ -1425,6 +1435,32 @@ func (d *CSIDriver) cachedClusterAvailableCapacity(ctx context.Context) (int64, 
 	return d.hsclient.GetClusterAvailableCapacity(ctx)
 }
 
+// backingShareCapacitySeconds is how long a backing share's free space is
+// reused by GetCapacity, for the same reason as cachedClusterAvailableCapacity:
+// the provisioner refreshes every StorageClass in turn, so one share lookup
+// stuck on a slow Anvil held up every other class, including a new class
+// waiting for its first CSIStorageCapacity.
+const backingShareCapacitySeconds = 60
+
+// cachedBackingShareAvailable returns the free space of the named backing
+// share and whether the share exists, preferring a figure fetched in the last
+// backingShareCapacitySeconds. A share that doesn't exist yet isn't cached, so
+// its first creation is seen on the next poll.
+func (d *CSIDriver) cachedBackingShareAvailable(ctx context.Context, name string) (int64, bool, error) {
+	key := "BACKING_SHARE_FREE:" + name
+	if cached, _ := common.GetCacheData(key); cached != nil {
+		if free, ok := cached.(int64); ok {
+			return free, true, nil
+		}
+	}
+	share, err := d.hsclient.GetShare(ctx, name)
+	if err != nil || share == nil {
+		return 0, false, err
+	}
+	common.SetCacheData(key, share.Space.Available, backingShareCapacitySeconds)
+	return share.Space.Available, true, nil
+}
+
 func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	// Start a span for tracing
 	ctx, span := tracer.Start(ctx, "Controller/GetCapacity", trace.WithAttributes())
@@ -1463,12 +1499,12 @@ func (d *CSIDriver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 
 	var available int64
 	if backingShareName != "" {
-		backingShare, err := d.hsclient.GetShare(ctx, backingShareName)
+		free, exists, err := d.cachedBackingShareAvailable(ctx, backingShareName)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "backing share %s: %v", backingShareName, err)
 		}
-		if backingShare != nil {
-			available = backingShare.Space.Available
+		if exists {
+			available = free
 		} else {
 			// Not created yet; it will be carved from cluster capacity.
 			available, err = d.cachedClusterAvailableCapacity(ctx)

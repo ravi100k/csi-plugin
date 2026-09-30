@@ -91,6 +91,9 @@ spec:
             # created StorageClass. Keep publication comfortably inside that
             # window instead of relying on the provisioner's 1 minute default.
             - "--capacity-poll-interval=30s"
+            # Refresh several StorageClasses at once, so one slow Anvil
+            # lookup can't hold a new class past that 60 second window.
+            - "--capacity-threads=4"
           env:
             - name: CSI_ENDPOINT
               value: /var/lib/csi/hs-csi.sock
