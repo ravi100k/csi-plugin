@@ -487,35 +487,15 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 	if err != nil {
 		return status.Errorf(codes.Internal, "%s", err.Error())
 	}
-	resumingRestore := false
 	if file != nil {
-		switch {
-		case file.Size == hsVolume.Size && hsVolume.SourceSnapPath == "":
-			return nil
-		case file.Size == hsVolume.Size:
-			// A previous CreateVolume attempt may have grown the raw file and
-			// stopped before growing the restored filesystem. Re-enter the
-			// reconciliation path; it is idempotent when already complete.
-			resumingRestore = true
-		case hsVolume.SourceSnapPath != "" && file.Size < hsVolume.Size:
-			// A snapshot restore that grows the raw file after
-			// RestoreFileSnapToDestination (below) can be interrupted between the
-			// restore succeeding and the growth completing. On a plain CreateVolume
-			// retry the file then already exists at its still-small, not-yet-grown
-			// size, and this check would otherwise reject it as AlreadyExists
-			// forever, with no way to finish the growth. Recognize that specific,
-			// safe case — our own restore request, with an existing file strictly
-			// smaller than requested — and resume it below rather than re-issuing
-			// the restore. Every other mismatch is still rejected, including a file
-			// LARGER than requested, which a resumed restore can never produce.
-			resumingRestore = true
-		default:
+		if file.Size != hsVolume.Size {
 			return status.Errorf(
 				codes.AlreadyExists,
 				common.VolumeExistsSizeMismatch,
 				file.Size,
 				hsVolume.Size)
 		}
+		return nil
 	}
 
 	// Step 2: Validate size and capacity
@@ -523,16 +503,8 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 		return status.Error(codes.InvalidArgument, common.BlockVolumeSizeNotSpecified)
 	}
 	available := backingShare.Space.Available
-	// On a resumed restore the file already exists and its bytes are already
-	// counted against the share, so only the REMAINING growth needs to fit.
-	// Demanding the full requested size again would reject a resume on a
-	// nearly-full backing share permanently, with no way to finish it.
-	needed := hsVolume.Size
-	if resumingRestore && file != nil {
-		needed = hsVolume.Size - file.Size
-	}
-	if needed > available {
-		return status.Errorf(codes.OutOfRange, common.OutOfCapacity, needed, available)
+	if hsVolume.Size > available {
+		return status.Errorf(codes.OutOfRange, common.OutOfCapacity, hsVolume.Size, available)
 	}
 
 	backingDir := common.ShareStagingDir + backingShare.ExportPath
@@ -540,15 +512,11 @@ func (d *CSIDriver) ensureDeviceFileExists(ctx context.Context, backingShare *co
 
 	// Step 3: Create file from snapshot or empty
 	if hsVolume.SourceSnapPath != "" {
-		if resumingRestore {
-			log.Infof("resuming capacity reconciliation for already-restored file %s", hsVolume.Path)
-		} else {
-			// Restore from snapshot
-			err := d.hsclient.RestoreFileSnapToDestination(ctx, hsVolume.SourceSnapPath, hsVolume.Path)
-			if err != nil {
-				log.Errorf("Failed to restore from snapshot, %v", err)
-				return status.Error(codes.NotFound, common.UnknownError)
-			}
+		// Restore from snapshot
+		err := d.hsclient.RestoreFileSnapToDestination(ctx, hsVolume.SourceSnapPath, hsVolume.Path)
+		if err != nil {
+			log.Errorf("Failed to restore from snapshot, %v", err)
+			return status.Error(codes.NotFound, common.UnknownError)
 		}
 
 		// Reconcile the sparse raw file and its embedded filesystem before
