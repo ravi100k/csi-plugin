@@ -129,3 +129,50 @@ func TestClusterStateIsCached(t *testing.T) {
 		t.Fatalf("/cntl/state queried %d times, want 1", calls)
 	}
 }
+
+// A portal in maintenance or briefly down is still this Anvil's: its address
+// must count as an NFS server, or a healthy backing mount through it is
+// treated as foreign and torn down. Mount selection still uses only up portals.
+func TestNFSServerAddressesIncludesPortalsInAnyState(t *testing.T) {
+	setupHTTP()
+	defer tearDownHTTP()
+	for _, key := range []string{"DATA_PORTALS", "CLUSTER_STATE"} {
+		common.SetCacheData(key, nil, 60)
+	}
+	t.Cleanup(func() {
+		for _, key := range []string{"DATA_PORTALS", "CLUSTER_STATE"} {
+			common.SetCacheData(key, nil, 60)
+		}
+	})
+	Mux.HandleFunc(BasePath+"/data-portals/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[
+			{"operState":"UP","adminState":"UP","dataPortalType":"NFS_V3","node":{"name":"a","mgmtIpAddress":{"address":"10.0.0.1"}}},
+			{"operState":"UP","adminState":"DOWN","dataPortalType":"NFS_V3","node":{"name":"b","mgmtIpAddress":{"address":"10.0.0.2"}}}
+		]`)
+	})
+	Mux.HandleFunc(BasePath+"/cntl/state", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"name":"c","portalFloatingIps":[{"address":"10.0.0.9"}]}`)
+	})
+
+	addresses, err := hsclient.NFSServerAddresses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"10.0.0.1": true, "10.0.0.2": true, "10.0.0.9": true}
+	if len(addresses) != len(want) {
+		t.Fatalf("addresses = %v, want %v", addresses, want)
+	}
+	for _, a := range addresses {
+		if !want[a] {
+			t.Fatalf("addresses = %v, want %v", addresses, want)
+		}
+	}
+
+	portals, err := hsclient.GetDataPortals(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(portals) != 1 || portals[0].Node.MgmtIpAddress.Address != "10.0.0.1" {
+		t.Fatalf("mountable portals = %+v, want only the up portal 10.0.0.1", portals)
+	}
+}

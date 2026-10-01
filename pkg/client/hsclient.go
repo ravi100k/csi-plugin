@@ -171,12 +171,13 @@ func (client *HammerspaceClient) clusterState(ctx context.Context) (*common.Clus
 	return &clusters, nil
 }
 
-// NFSServerAddresses returns every address the driver may mount a share from:
-// the data portals that are up and all of the cluster's floating data-portal
-// IPs. A backing-share mount from any other server was made against a
-// different Anvil.
+// NFSServerAddresses returns every address this Anvil serves shares from: all
+// of its data portals and floating data-portal IPs. A backing-share mount from
+// any other server was made against a different Anvil. Portals count whatever
+// their state: one in maintenance, or briefly down, still belongs to this
+// Anvil, and its mount must not be mistaken for a foreign one.
 func (client *HammerspaceClient) NFSServerAddresses(ctx context.Context) ([]string, error) {
-	portals, err := client.upDataPortals(ctx)
+	portals, err := client.dataPortals(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -264,9 +265,26 @@ func (client *HammerspaceClient) GetDataPortals(ctx context.Context, nodeID stri
 	return sortedPortals, nil
 }
 
-// upDataPortals returns the NFS data portals that are up, reusing a list
-// fetched in the last portalCacheSeconds. Callers must not modify it.
+// upDataPortals returns the NFS data portals that are up, from the list
+// fetched in the last portalCacheSeconds.
 func (client *HammerspaceClient) upDataPortals(ctx context.Context) ([]common.DataPortal, error) {
+	portals, err := client.dataPortals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var filteredPortals []common.DataPortal
+	for _, p := range portals {
+		if p.OperState == "UP" && p.AdminState == "UP" && p.DataPortalType == "NFS_V3" {
+			filteredPortals = append(filteredPortals, p)
+		}
+	}
+	return filteredPortals, nil
+}
+
+// dataPortals returns every data portal of the Anvil, whatever its state,
+// reusing a list fetched in the last portalCacheSeconds. Callers must not
+// modify it.
+func (client *HammerspaceClient) dataPortals(ctx context.Context) ([]common.DataPortal, error) {
 	if cached, _ := common.GetCacheData("DATA_PORTALS"); cached != nil {
 		if portals, ok := cached.([]common.DataPortal); ok {
 			return portals, nil
@@ -296,16 +314,8 @@ func (client *HammerspaceClient) upDataPortals(ctx context.Context) ([]common.Da
 		return nil, err
 	}
 
-	// filter dataportals
-	var filteredPortals []common.DataPortal
-	for _, p := range portals {
-		if p.OperState == "UP" && p.AdminState == "UP" && p.DataPortalType == "NFS_V3" {
-			filteredPortals = append(filteredPortals, p)
-		}
-	}
-
-	common.SetCacheData("DATA_PORTALS", filteredPortals, portalCacheSeconds)
-	return filteredPortals, nil
+	common.SetCacheData("DATA_PORTALS", portals, portalCacheSeconds)
+	return portals, nil
 }
 
 // Logs into Hammerspace Anvil Server
