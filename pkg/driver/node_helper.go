@@ -391,22 +391,39 @@ func (d *CSIDriver) publishFileBackedVolume(ctx context.Context, backingShareNam
 	// Writable publish retains an idempotent repair path for older volumes or
 	// provisioning attempts interrupted before filesystem reconciliation.
 	if fsType != "" && !readOnly {
-		if err := reconcileFilesystem(targetPath, filePath, fsType); err != nil {
-			if !mounted {
-				// Fresh mount: this is where a restored volume gets the capacity
-				// its PVC asked for, so a failure here must surface.
-				log.Errorf("failed to reconcile filesystem size at %s: %v", targetPath, err)
-				return status.Errorf(codes.Internal, "failed to reconcile filesystem size: %v", err)
-			}
-			// Already mounted, i.e. a republish of a healthy volume
-			// (requiresRepublish drives these periodically). The reconcile is a
-			// no-op in the steady state, so a transient loop-device lookup
-			// failure here must not tear down a working volume -- warn and let
-			// the next republish retry.
-			log.Warnf("could not reconcile filesystem size at %s on republish: %v", targetPath, err)
+		if err := reconcilePublishedFilesystem(ctx, targetPath, filePath, fsType, !mounted); err != nil {
+			d.UnmountBackingShareIfUnused(ctx, backingShareName)
+			return err
 		}
 	}
 	return nil
+}
+
+// reconcilePublishedFilesystem grows the filesystem mounted at targetPath to its
+// backing file. freshMount says whether this publish just mounted it.
+func reconcilePublishedFilesystem(ctx context.Context, targetPath, filePath, fsType string, freshMount bool) error {
+	err := reconcileFilesystem(targetPath, filePath, fsType)
+	if err == nil {
+		return nil
+	}
+	if !freshMount {
+		// Already mounted, i.e. a republish of a healthy volume
+		// (requiresRepublish drives these periodically). The reconcile is a
+		// no-op in the steady state, so a transient loop-device lookup
+		// failure here must not tear down a working volume -- warn and let
+		// the next republish retry.
+		log.Warnf("could not reconcile filesystem size at %s on republish: %v", targetPath, err)
+		return nil
+	}
+	// Fresh mount: this is where a restored volume gets the capacity its PVC
+	// asked for, so a failure here must surface. Undo the mount, or kubelet's
+	// retry finds targetPath mounted, takes the republish branch above and
+	// reports success on an undersized filesystem.
+	log.Errorf("failed to reconcile filesystem size at %s: %v", targetPath, err)
+	if unmountErr := unmountFilesystem(ctx, targetPath); unmountErr != nil {
+		log.Errorf("failed to unmount %s after reconcile failure: %v", targetPath, unmountErr)
+	}
+	return status.Errorf(codes.Internal, "failed to reconcile filesystem size: %v", err)
 }
 
 // NodeUnpublishVolume

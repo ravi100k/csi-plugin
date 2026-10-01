@@ -57,6 +57,41 @@ func TestGrowFilesystemPrivately(t *testing.T) {
 	}
 }
 
+// A failed reconcile on a fresh publish must undo the mount: kubelet's retry
+// would otherwise find targetPath mounted, treat it as a republish and report
+// success on an undersized filesystem. A republish keeps its working mount.
+func TestReconcilePublishedFilesystemUnmountsFreshMountOnFailure(t *testing.T) {
+	originalReconcile := reconcileFilesystem
+	originalUnmount := unmountFilesystem
+	defer func() {
+		reconcileFilesystem = originalReconcile
+		unmountFilesystem = originalUnmount
+	}()
+	reconcileFilesystem = func(string, string, string) error { return fmt.Errorf("resize2fs failed") }
+
+	for _, tc := range []struct {
+		fresh       bool
+		wantErr     bool
+		wantUnmount bool
+	}{
+		{fresh: true, wantErr: true, wantUnmount: true},
+		{fresh: false, wantErr: false, wantUnmount: false},
+	} {
+		var unmounted []string
+		unmountFilesystem = func(_ context.Context, target string) error {
+			unmounted = append(unmounted, target)
+			return nil
+		}
+		err := reconcilePublishedFilesystem(context.Background(), "/target", "/tmp/share/volume", "ext4", tc.fresh)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("fresh=%v: err = %v, want error %v", tc.fresh, err, tc.wantErr)
+		}
+		if got := len(unmounted) == 1 && unmounted[0] == "/target"; got != tc.wantUnmount {
+			t.Errorf("fresh=%v: unmounted = %v, want unmount of /target %v", tc.fresh, unmounted, tc.wantUnmount)
+		}
+	}
+}
+
 // A filesystem that is already full size must not be mounted writable: a
 // ReadOnlyMany volume may be mounted read-only by other pods at the same time.
 func TestGrowFilesystemPrivatelySkipsFullSizeFilesystem(t *testing.T) {
