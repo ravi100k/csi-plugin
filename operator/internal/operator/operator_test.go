@@ -379,6 +379,56 @@ func TestReconcileCreateDriftRotationAndUpgrade(t *testing.T) {
 	}
 }
 
+// Apply patches to existing operands carry the UID, so a replaced object is
+// rejected, but no resourceVersion: workload status changes between GET and
+// PATCH would otherwise fail the patch with 409 and mark the CR Degraded.
+func TestApplyPatchesPinUIDNotResourceVersion(t *testing.T) {
+	r, c := harness(t)
+	ctx := context.Background()
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The fake tracker assigns no UIDs or resourceVersions; set them as the apiserver would.
+	for _, o := range mustRender(t, testCR()) {
+		current, err := r.resource(o).Get(ctx, o.GetName(), metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.SetUID(types.UID("uid-" + o.GetKind() + "-" + o.GetName()))
+		current.SetResourceVersion("42")
+		if _, err := r.resource(o).Update(ctx, current, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var patches []map[string]interface{}
+	c.PrependReactor("patch", "*", func(action ktesting.Action) (bool, runtime.Object, error) {
+		a := action.(ktesting.PatchAction)
+		if a.GetPatchType() == types.ApplyPatchType {
+			var patch map[string]interface{}
+			if err := json.Unmarshal(a.GetPatch(), &patch); err != nil {
+				t.Fatal(err)
+			}
+			patches = append(patches, patch)
+		}
+		return false, nil, nil
+	})
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) == 0 {
+		t.Fatal("second reconcile applied no patches")
+	}
+	for _, patch := range patches {
+		meta := patch["metadata"].(map[string]interface{})
+		if rv, ok := meta["resourceVersion"]; ok {
+			t.Errorf("%s %s: apply patch carries resourceVersion %v", patch["kind"], meta["name"], rv)
+		}
+		if uid, want := meta["uid"], fmt.Sprintf("uid-%s-%s", patch["kind"], meta["name"]); uid != want {
+			t.Errorf("%s %s: apply patch uid = %v, want %s", patch["kind"], meta["name"], uid, want)
+		}
+	}
+}
+
 func TestOwnershipConflictDoesNotChangeOperands(t *testing.T) {
 	r, c := harness(t)
 	ctx := context.Background()

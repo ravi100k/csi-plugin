@@ -134,9 +134,13 @@ func (r *Reconciler) apply(ctx context.Context, cr, desired *unstructured.Unstru
 	if !ownedBy(current, cr) {
 		return fmt.Errorf("ownership changed for %s %s", desired.GetKind(), desired.GetName())
 	}
-	// Optimistic concurrency prevents a delete/recreate between GET and PATCH
-	// from accidentally adopting an unrelated replacement with the same name.
-	desired.SetResourceVersion(current.GetResourceVersion())
+	// The UID stops a delete/recreate between GET and PATCH from adopting an
+	// unrelated replacement with the same name: metadata.uid is immutable, so
+	// the apiserver rejects the patch if the object was replaced. No
+	// resourceVersion: kube-controller-manager updates workload status
+	// constantly, and every such update would turn this patch into a 409
+	// Conflict and the CR into Degraded during a routine rollout.
+	desired.SetResourceVersion("")
 	desired.SetUID(current.GetUID())
 	b, err := json.Marshal(desired.Object)
 	if err != nil {
