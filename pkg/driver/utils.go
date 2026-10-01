@@ -304,12 +304,25 @@ func classifyMount(path string, probes int, probe func(string) (bool, error)) mo
 }
 
 func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareName string, hsVol *common.HSVolume) error {
+	return d.ensureBackingShareMounted(ctx, backingShareName, hsVol, false)
+}
+
+// ensureBackingShareMounted mounts the backing share if needed. refHeld means
+// the caller (acquireBackingMount) already holds the share's mount lock and one
+// mountRefs reference; every other caller is serialized here on that lock, so
+// two callers can't both replace a foreign mount and unmount each other's.
+func (d *CSIDriver) ensureBackingShareMounted(ctx context.Context, backingShareName string, hsVol *common.HSVolume, refHeld bool) error {
 	backingShare, err := d.hsclient.GetShare(ctx, backingShareName)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "%s", err.Error())
 	}
 	if backingShare != nil {
 		backingDir := common.ShareStagingDir + backingShare.ExportPath
+		if !refHeld {
+			ml := d.mountLockFor(backingDir)
+			ml.Lock()
+			defer ml.Unlock()
+		}
 		// Classify the existing mount. We only force-unmount when it is CONFIRMED
 		// stale (mountStaleProbes consecutive mount-check timeouts) — never on a
 		// single timeout, which can be a slow-but-healthy stat under load and
@@ -326,10 +339,18 @@ func (d *CSIDriver) EnsureBackingShareMounted(ctx context.Context, backingShareN
 				return nil
 			}
 			// Reusing this mount would create and read volume files on another
-			// Anvil's share. Replace it, unless volumes on it are still attached.
-			inUse, err := backingFilesInUse(backingDir)
-			if err != nil {
-				return err
+			// Anvil's share. Replace it, unless volumes on it are still attached
+			// or another operation holds a reference: an in-flight create has no
+			// loop device until its mkfs is done.
+			others := d.backingMountRefs(backingDir)
+			if refHeld {
+				others--
+			}
+			inUse := others > 0
+			if !inUse {
+				if inUse, err = backingFilesInUse(backingDir); err != nil {
+					return err
+				}
 			}
 			if inUse {
 				return status.Errorf(codes.FailedPrecondition,
@@ -530,7 +551,7 @@ func (d *CSIDriver) acquireBackingMount(ctx context.Context, backingShare *commo
 
 	// Reserve the reference first; `first` is true only on the 0->1 transition.
 	if first := d.bumpBackingRef(backingDir); first {
-		if err := d.EnsureBackingShareMounted(ctx, backingShare.Name, hsVol); err != nil {
+		if err := d.ensureBackingShareMounted(ctx, backingShare.Name, hsVol, true); err != nil {
 			// Roll back the reservation so a failed mount doesn't leak a reference
 			// that would keep the (unmounted) share pinned as "in use" forever.
 			d.dropBackingRef(backingDir)
@@ -607,9 +628,15 @@ func (d *CSIDriver) dropBackingRef(backingDir string) (last bool) {
 // with UnmountBackingShareIfUnused so the two mechanisms can't disagree and
 // unmount a share out from under an in-flight mkfs.
 func (d *CSIDriver) backingMountInUse(mountPath string) bool {
+	return d.backingMountRefs(mountPath) > 0
+}
+
+// backingMountRefs returns the number of in-flight references on the
+// backing-share staging mount at mountPath.
+func (d *CSIDriver) backingMountRefs(mountPath string) int {
 	d.mountRefsMu.Lock()
 	defer d.mountRefsMu.Unlock()
-	return d.mountRefs[mountPath] > 0
+	return d.mountRefs[mountPath]
 }
 
 func (d *CSIDriver) UnmountBackingShareIfUnused(ctx context.Context, backingShareName string) (bool, error) {

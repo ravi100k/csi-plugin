@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/hammer-space/csi-plugin/pkg/client"
@@ -52,7 +53,7 @@ func useFakeBackingMount(t *testing.T, f *fakeBackingMount) *CSIDriver {
 		f.server = ""
 		return nil
 	}
-	return &CSIDriver{hsclient: hs}
+	return &CSIDriver{hsclient: hs, mountRefs: map[string]int{}, mountLocks: map[string]*sync.Mutex{}}
 }
 
 func TestBackingMountFromCurrentAnvilIsReused(t *testing.T) {
@@ -92,6 +93,36 @@ func TestBackingMountFromPreviousAnvilInUseIsRefused(t *testing.T) {
 	}
 	if len(f.unmounted) != 0 {
 		t.Fatalf("a mount loop devices still use must not be unmounted, unmounted %v", f.unmounted)
+	}
+}
+
+// An in-flight create holds a reference but has no loop device until its mkfs
+// is done; replacing the mount under it would fail the create or send its file
+// to the node's local disk.
+func TestBackingMountFromPreviousAnvilWithInFlightCreateIsRefused(t *testing.T) {
+	f := &fakeBackingMount{server: "10.0.9.9", current: []string{"10.0.0.5"}}
+	d := useFakeBackingMount(t, f)
+	d.bumpBackingRef(common.ShareStagingDir + "/backing")
+
+	err := d.EnsureBackingShareMounted(context.Background(), "backing", &common.HSVolume{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition", err)
+	}
+	if len(f.unmounted) != 0 {
+		t.Fatalf("a mount an in-flight create references must not be unmounted, unmounted %v", f.unmounted)
+	}
+}
+
+// The caller's own reference (acquireBackingMount) doesn't count as another user.
+func TestBackingMountFromPreviousAnvilOwnReferenceIsReplaced(t *testing.T) {
+	f := &fakeBackingMount{server: "10.0.9.9", current: []string{"10.0.0.5"}}
+	d := useFakeBackingMount(t, f)
+	backingDir := common.ShareStagingDir + "/backing"
+	d.bumpBackingRef(backingDir)
+
+	_ = d.ensureBackingShareMounted(context.Background(), "backing", &common.HSVolume{}, true)
+	if len(f.unmounted) != 1 || f.unmounted[0] != backingDir {
+		t.Fatalf("the old Anvil's mount should have been unmounted once at %s, unmounted %v", backingDir, f.unmounted)
 	}
 }
 
