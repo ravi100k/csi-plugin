@@ -16,7 +16,12 @@ limitations under the License.
 
 package common
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"path"
+	"strings"
+	"time"
+)
 
 // Structures to hold information about a plugin created volume
 type HSVolumeParameters struct {
@@ -181,6 +186,36 @@ type FileChildren struct {
 	SharePath  string `json:"sharePath"`
 	ShareName  string `json:"shareName"`
 	CreateTime int64  `json:"createTime"`
+}
+
+// EntryName returns the child's name. Some Anvil versions (seen on 5.3.1)
+// leave "name" empty for the entries of a directory listed without a trailing
+// slash, so fall back to the last element of its path ("<dir>/<name>/").
+func (c FileChildren) EntryName() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return path.Base(strings.TrimSuffix(c.Path, "/"))
+}
+
+// shareSnapshotNameLayout is the timestamp prefix of an Anvil share snapshot
+// name, e.g. "2026-10-01T15-25-39" in "2026-10-01T15-25-39-0".
+const shareSnapshotNameLayout = "2006-01-02T15-04-05"
+
+// ShareSnapshotCreateTime returns a share snapshot's creation time in Unix
+// seconds. The Anvil may report createTime as null for .snapshot entries, so
+// fall back to the timestamp the snapshot is named after (taken as UTC), and
+// to 0 when neither is available.
+func ShareSnapshotCreateTime(name string, createTime int64) int64 {
+	if createTime > 0 {
+		return createTime
+	}
+	if len(name) >= len(shareSnapshotNameLayout) {
+		if t, err := time.Parse(shareSnapshotNameLayout, name[:len(shareSnapshotNameLayout)]); err == nil {
+			return t.Unix()
+		}
+	}
+	return 0
 }
 
 type FileSnapshot struct {

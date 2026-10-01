@@ -589,8 +589,12 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 
 	// Iterate over each share
 	for _, share := range shares {
-		// Skip shares that don't match the provided volume_id (if specified)
-		if volume_id != "" && share.Name != volume_id {
+		// Skip shares that don't match the provided volume_id (if specified).
+		// The CO identifies a share-backed volume by its EXPORT PATH ("/pvc-x"),
+		// not the bare share name ("pvc-x"), so compare against the path -- and
+		// against the same value reported as SourceVolumeId below, or filtering
+		// by source_volume_id silently matches nothing.
+		if volume_id != "" && path.Clean(share.ExportPath) != path.Clean(volume_id) {
 			continue
 		}
 
@@ -598,8 +602,10 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 		shareSnapshotDir := share.ExportPath + "/.snapshot/"
 		shareFile, err := client.GetFile(ctx, shareSnapshotDir)
 		if err != nil {
-			log.Errorf("Failed to get share snapshots from %s: %v", shareSnapshotDir, err)
-			return nil, err
+			// One unreadable share must not fail the listing of every other
+			// share's snapshots; report what can be read.
+			log.Errorf("Failed to get share snapshots from %s, skipping share: %v", shareSnapshotDir, err)
+			continue
 		}
 
 		// assume no snapshot is there if shareFile is nil
@@ -610,10 +616,20 @@ func (client *HammerspaceClient) ListSnapshots(ctx context.Context, snapshot_id,
 
 		// Iterate over the snapshots in the /.snapshot/ directory
 		for _, snapshotFile := range shareFile.Children {
+			// "current" is the live view of the share, not a snapshot. The
+			// snapshot-list API prunes it (see GetShareSnapshots); reading the
+			// directory directly has to prune it here.
+			name := snapshotFile.EntryName()
+			if name == "current" {
+				continue
+			}
 			snapshot := common.SnapshotResponse{
-				Id:             snapshotFile.Name,
-				Created:        snapshotFile.CreateTime,
-				SourceVolumeId: share.Name,
+				Id:      name,
+				Created: common.ShareSnapshotCreateTime(name, snapshotFile.CreateTime),
+				// The CO identifies a volume by its CSI volume ID, which for a
+				// share-backed volume is the share's export path, not the bare
+				// share name -- callers filter on this.
+				SourceVolumeId: share.ExportPath,
 				ReadyToUse:     true, // Assume true if the snapshot exists
 				Size:           snapshotFile.Size,
 			}
@@ -710,6 +726,36 @@ func (client *HammerspaceClient) GetFile(ctx context.Context, path string) (*com
 func (client *HammerspaceClient) DoesFileExist(ctx context.Context, path string) (bool, error) {
 	file, err := client.GetFile(ctx, path)
 	return file != nil, err
+}
+
+// GetDirSize returns the total size in bytes of everything under dirPath, and
+// whether dirPath exists. A plain directory listing reports a null size for
+// directories (including the entries of a share's .snapshot directory);
+// getParentDirSize=true makes the Anvil report the directory's own aggregate
+// size, and page.size=1 keeps it from also returning every child.
+func (client *HammerspaceClient) GetDirSize(ctx context.Context, dirPath string) (int64, bool, error) {
+	req, err := client.generateRequest(ctx, "GET",
+		"/files?path="+url.QueryEscape(dirPath)+"&getParentDirSize=true&page.size=1", "")
+	if err != nil {
+		return 0, false, err
+	}
+	statusCode, respBody, _, err := client.doRequest(ctx, *req)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// FIXME: we get a 500 from the api if it does not exist, should be a 404
+	if statusCode == 500 || statusCode == 404 {
+		return 0, false, nil
+	}
+	if statusCode != 200 {
+		return 0, false, fmt.Errorf(common.UnexpectedHSStatusCode, statusCode, 200)
+	}
+	var file common.File
+	if err := json.Unmarshal([]byte(respBody), &file); err != nil {
+		return 0, false, err
+	}
+	return file.Size, true, nil
 }
 
 func (client *HammerspaceClient) CreateShare(ctx context.Context,

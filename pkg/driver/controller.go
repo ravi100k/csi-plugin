@@ -923,6 +923,7 @@ func (d *CSIDriver) deleteFileBackedVolume(ctx context.Context, filepath string)
 	// Check if file has snapshots and fail
 	snaps, _ := d.hsclient.GetFileSnapshots(ctx, filepath)
 	if len(snaps) > 0 {
+		log.Warnf("Not deleting file-backed volume %s: it still has %d snapshot(s)", filepath, len(snaps))
 		return status.Errorf(codes.FailedPrecondition, common.VolumeDeleteHasSnapshots)
 	}
 
@@ -981,6 +982,7 @@ func (d *CSIDriver) deleteShareBackedVolume(ctx context.Context, share *common.S
 		return status.Errorf(codes.Internal, "%s", err.Error())
 	}
 	if len(snaps) > 0 {
+		log.Warnf("Not deleting share %s: it still has %d snapshot(s) %v", share.Name, len(snaps), snaps)
 		return status.Errorf(codes.FailedPrecondition, common.VolumeDeleteHasSnapshots)
 	}
 
@@ -1616,8 +1618,26 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 	// Initialize a slice to hold the snapshot entries
 	var snapshots []*csi.ListSnapshotsResponse_Entry
 
+	// An exact snapshot_id lookup is how the external snapshotter checks
+	// whether a snapshot is ready. Resolve it from the ID itself rather than by
+	// scanning shares: the ID carries its own source volume
+	// ("<snapshot>|<volume>"), so this is one lookup instead of a full
+	// enumeration, and it works for file-backed snapshots, which do not appear
+	// in a share's .snapshot directory at all.
+	if req.GetSnapshotId() != "" {
+		entry, err := d.findSnapshotByID(ctx, req.GetSnapshotId())
+		if err != nil {
+			return nil, err
+		}
+		if entry != nil &&
+			(req.GetSourceVolumeId() == "" || entry.Snapshot.SourceVolumeId == req.GetSourceVolumeId()) {
+			snapshots = append(snapshots, entry)
+		}
+		return &csi.ListSnapshotsResponse{Entries: snapshots}, nil
+	}
+
 	// Fetch all snapshots from the backend storage
-	backendSnapshots, err := d.hsclient.ListSnapshots(ctx, req.SnapshotId, req.SourceVolumeId)
+	backendSnapshots, err := d.hsclient.ListSnapshots(ctx, "", req.SourceVolumeId)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -1629,13 +1649,8 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 		}, nil
 	}
 
-	// Apply filtering based on snapshot_id and source_volume_id
+	// Apply filtering based on source_volume_id
 	for _, snapshot := range backendSnapshots {
-		// Filter by snapshot_id if provided
-		if req.GetSnapshotId() != "" && snapshot.Id != req.GetSnapshotId() {
-			continue
-		}
-
 		// Filter by source_volume_id if provided
 		if req.GetSourceVolumeId() != "" && snapshot.SourceVolumeId != req.GetSourceVolumeId() {
 			continue
@@ -1644,8 +1659,11 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 		// Build the SnapshotEntry for each matching snapshot
 		snapshotEntry := &csi.ListSnapshotsResponse_Entry{
 			Snapshot: &csi.Snapshot{
-				SizeBytes:      snapshot.Size,
-				SnapshotId:     snapshot.Id,
+				SizeBytes: snapshot.Size,
+				// The backend knows a snapshot only by its own name. The CO must
+				// get back the same composite ID CreateSnapshot handed out, or it
+				// cannot match these entries to the snapshots it already knows.
+				SnapshotId:     GetSnapshotIDFromSnapshotName(snapshot.Id, snapshot.SourceVolumeId),
 				ReadyToUse:     snapshot.ReadyToUse,
 				SourceVolumeId: snapshot.SourceVolumeId,
 				CreationTime: &timestamp.Timestamp{
@@ -1662,4 +1680,89 @@ func (d *CSIDriver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 	return &csi.ListSnapshotsResponse{
 		Entries: snapshots,
 	}, nil
+}
+
+// findSnapshotByID resolves a single CSI snapshot ID against the backend,
+// returning (nil, nil) when no such snapshot exists -- the CSI specification
+// requires an unknown snapshot_id to produce an empty list, not an error.
+func (d *CSIDriver) findSnapshotByID(ctx context.Context, snapshotID string) (*csi.ListSnapshotsResponse_Entry, error) {
+	snapshotName, nameErr := GetSnapshotNameFromSnapshotId(snapshotID)
+	sourceVolumeID, volErr := GetSnapshotSourceVolumeId(snapshotID)
+	if nameErr != nil || volErr != nil {
+		log.Warnf("ListSnapshots: malformed snapshot ID %s; reporting it as absent", snapshotID)
+		return nil, nil
+	}
+
+	entry := func(size, created int64) *csi.ListSnapshotsResponse_Entry {
+		return &csi.ListSnapshotsResponse_Entry{
+			Snapshot: &csi.Snapshot{
+				SizeBytes:      size,
+				SnapshotId:     snapshotID,
+				SourceVolumeId: sourceVolumeID,
+				ReadyToUse:     true,
+				CreationTime:   &timestamp.Timestamp{Seconds: created},
+			},
+		}
+	}
+
+	if isFileBackedVolumeID(sourceVolumeID) {
+		// A file-backed snapshot's name IS its path on the Anvil
+		// (<share>/.fsnapshot/<timestamp>/<file>), so listing its parent
+		// directory settles both its existence and its size.
+		child, err := d.snapshotDirEntry(ctx, path.Dir(snapshotName), path.Base(snapshotName))
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "could not look up snapshot %s: %v", snapshotID, err)
+		}
+		if child == nil {
+			return nil, nil
+		}
+		return entry(child.Size, child.CreateTime), nil
+	}
+
+	shareName := GetVolumeNameFromPath(sourceVolumeID)
+	share, err := d.hsclient.GetShare(ctx, shareName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "could not look up source share %s: %v", shareName, err)
+	}
+	if share == nil {
+		return nil, nil
+	}
+	snapshotNames, err := d.hsclient.GetShareSnapshots(ctx, shareName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "could not list snapshots of share %s: %v", shareName, err)
+	}
+	if !slice.ContainsString(snapshotNames, snapshotName, strings.TrimSpace) {
+		return nil, nil
+	}
+
+	// Size is extra detail, not part of readiness: report the snapshot even
+	// when its size cannot be read. The .snapshot listing reports a null size
+	// and createTime for snapshot directories, so ask for the snapshot
+	// directory's aggregate size directly, and take the creation time from the
+	// timestamp the snapshot is named after.
+	size, _, err := d.hsclient.GetDirSize(ctx, path.Join(share.ExportPath, ".snapshot", snapshotName))
+	if err != nil {
+		log.Warnf("ListSnapshots: could not read the size of snapshot %s: %v", snapshotID, err)
+		size = 0
+	}
+	return entry(size, common.ShareSnapshotCreateTime(snapshotName, 0)), nil
+}
+
+// snapshotDirEntry returns the named child of dir, or nil when either the
+// directory or the child is absent. Only a directory listing carries a child's
+// size and creation time; a direct lookup of the child itself does not.
+func (d *CSIDriver) snapshotDirEntry(ctx context.Context, dir, name string) (*common.FileChildren, error) {
+	parent, err := d.hsclient.GetFile(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if parent == nil {
+		return nil, nil
+	}
+	for i := range parent.Children {
+		if parent.Children[i].EntryName() == name {
+			return &parent.Children[i], nil
+		}
+	}
+	return nil, nil
 }
